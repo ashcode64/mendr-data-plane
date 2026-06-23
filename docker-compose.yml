@@ -1,0 +1,43 @@
+services:
+  mendr-gateway:
+    build: ./infra/nginx
+    image: mendr/data-plane:latest
+    ports:
+      - "8080:8080"
+    environment:
+      MENDR_CONTROL_PLANE_URL: ${MENDR_CONTROL_PLANE_URL:-https://api.mendr.io}
+      MENDR_REDIS_HOST: mendr-edge-redis
+      MENDR_REDIS_PORT: "6379"
+      MENDR_JAVA_FALLBACK: "false"
+      MENDR_DOCKER_HOST_REWRITE: ${MENDR_DOCKER_HOST_REWRITE:-host.docker.internal}
+      GATEWAY_INTERNAL_API_KEY: ${GATEWAY_INTERNAL_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./infra/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./infra/nginx/proxy-control.conf:/etc/nginx/proxy-control.conf:ro
+      - ./infra/nginx/lua:/etc/nginx/lua:ro
+    depends_on:
+      mendr-edge-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mendr-edge-redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6380:6379"
+    volumes:
+      - mendr_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mendr_redis_data:
