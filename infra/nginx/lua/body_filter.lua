@@ -20,9 +20,9 @@ end
 
 if chunk and chunk ~= "" then
     table.insert(ngx.ctx._resp_chunks, chunk)
-    if program then
-        ngx.arg[1] = nil
-    end
+    -- Always suppress the per-chunk passthrough. The full body is re-emitted once
+    -- at EOF below; without this the response is sent twice (duplicated JSON).
+    ngx.arg[1] = nil
 end
 
 if not eof then
