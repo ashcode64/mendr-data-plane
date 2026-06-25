@@ -20,9 +20,9 @@ end
 
 if chunk and chunk ~= "" then
     table.insert(ngx.ctx._resp_chunks, chunk)
-    if program then
-        ngx.arg[1] = nil
-    end
+    -- Always suppress the per-chunk passthrough. The full body is re-emitted once
+    -- at EOF below; without this the response is sent twice (duplicated JSON).
+    ngx.arg[1] = nil
 end
 
 if not eof then
@@ -67,6 +67,7 @@ if not program.streamable and not program.wrapKey and not program.unwrapKey then
     if program.defaults and next(program.defaults) then has_flat_ops = true end
     if program.coercions and next(program.coercions) then has_flat_ops = true end
     if program.removals and type(program.removals) == "table" and #program.removals > 0 then has_flat_ops = true end
+    if program.moves and type(program.moves) == "table" and #program.moves > 0 then has_flat_ops = true end
 
     if not has_flat_ops then
         ngx.ctx.transformedResponseBody = raw_body

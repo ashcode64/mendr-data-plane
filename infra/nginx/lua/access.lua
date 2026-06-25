@@ -46,6 +46,49 @@ local function origin_allowed(allowed_origins, origin)
     return false
 end
 
+-- Build a Lua pattern from a templated endpoint, e.g. "/menu-items/{id}" ->
+-- "^/menu%-items/[^/]+$". Used to match concrete paths to templated route keys.
+local function template_to_pattern(template)
+    local escaped = template:gsub("([%-%.%+%[%]%(%)%$%^%%%?%*])", "%%%1")
+    escaped = escaped:gsub("{[^}]+}", "[^/]+")
+    return "^" .. escaped .. "$"
+end
+
+-- Look up a route snapshot, first by exact key, then by matching the concrete
+-- endpoint against any templated ({param}) route key for the same service pair.
+local function lookup_route(red, source_service, target_service, endpoint)
+    local exact_key = "mendr:routeconfig:" .. source_service .. ":" .. target_service .. ":" .. endpoint
+    local res = red:get(exact_key)
+    if res and res ~= ngx.null then
+        return res
+    end
+
+    local prefix = "mendr:routeconfig:" .. source_service .. ":" .. target_service .. ":"
+    local keys, kerr = red:keys(prefix .. "*")
+    if not keys or keys == ngx.null then
+        if kerr then ngx.log(ngx.WARN, "access: route keys lookup failed: ", kerr) end
+        return nil
+    end
+
+    for _, key in ipairs(keys) do
+        local tmpl = key:sub(#prefix + 1)
+        if tmpl:find("{", 1, true) then
+            local ok = pcall(function()
+                return endpoint:match(template_to_pattern(tmpl))
+            end)
+            if ok and endpoint:match(template_to_pattern(tmpl)) then
+                local v = red:get(key)
+                if v and v ~= ngx.null then
+                    ngx.log(ngx.DEBUG, "access: matched templated route ", tmpl, " for ", endpoint)
+                    return v
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
 local function delegate_to_java(envelope, reason)
     ngx.log(ngx.INFO, "access: delegating to Java control plane — ", reason or "unspecified")
     ngx.ctx.javaFallback = true
@@ -129,8 +172,7 @@ local red, redis_err = redis_connect()
 local route_config = nil
 
 if red then
-    local redis_key = "mendr:routeconfig:" .. source_service .. ":" .. target_service .. ":" .. endpoint
-    local res, _ = red:get(redis_key)
+    local res = lookup_route(red, source_service, target_service, endpoint)
 
     if res and res ~= ngx.null then
         route_config, err = cjson.decode(res)
@@ -138,7 +180,8 @@ if red then
             ngx.log(ngx.WARN, "access: failed to decode route config: ", err)
         end
     else
-        ngx.log(ngx.DEBUG, "access: no route config in Redis for ", redis_key)
+        ngx.log(ngx.DEBUG, "access: no route config in Redis for ",
+            source_service, "->", target_service, endpoint)
     end
 
     redis_close(red)
