@@ -1,6 +1,5 @@
-# Mendr Edge — pull-only (same as release/docker-compose.yml).
-# For local development with live nginx/lua mounts, use:
-#   docker compose -f docker-compose.dev.yml up -d --build
+# Mendr Edge — pull-only customer compose (no build, no source repo required).
+# Requires: Docker Desktop or Docker Engine + Compose plugin
 
 services:
   mendr-gateway:

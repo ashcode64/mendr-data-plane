@@ -1,34 +1,63 @@
 # Mendr Data Plane
 
-This repository contains the lightweight edge data plane for Mendr:
+Lightweight Mendr edge data plane:
 
-- `mendr-gateway` (OpenResty/Lua)
-- `mendr-edge-redis` (local snapshot cache with AOF)
+- `mendr-gateway` (OpenResty/Lua) — local proxy and route snapshot cache
+- `mendr-edge-redis` — edge Redis for route config sync
 
-## Purpose
+Client services call the local edge at `http://localhost:8080`.
 
-Client services call the local data plane for:
+## For customers (Docker Hub install)
 
-- `POST /api/gateway/proxy`
-- `POST /api/services`
-- `POST /api/services/{name}/contracts`
-- `POST /api/gateway/cors-rules/bootstrap` (CORS policy bootstrap — forwarded to control plane)
-- `GET /api/gateway/cors-rules` (list active CORS rules — forwarded to control plane)
+Use the files in [`release/`](release/) or the zip `release/mendr-edge-1.0.0.zip`:
 
-The proxy hot path stays local. Registration and contract calls are forwarded upstream to the Mendr control plane.
+1. Create a folder (e.g. `~/mendr-edge`)
+2. Copy `docker-compose.yml` and `.env.example`
+3. `cp .env.example .env` and set control plane URL + API key
+4. `docker compose pull && docker compose up -d`
 
-## Run
+Image: **`teammendr/themendr:1.0.0`** (public on Docker Hub)
+
+See [release/README.md](release/README.md) for full install steps.
+
+## For developers (this repo)
+
+Build from source with live-mounted nginx/lua configs:
 
 ```powershell
-docker compose up -d --build
+cp .env.example .env
+# edit .env
+docker compose -f docker-compose.dev.yml up -d --build
+```
+
+## Publish a new image (maintainers)
+
+After creating the `teammendr/themendr` repo on Docker Hub:
+
+```powershell
+docker login
+.\scripts\build-and-push.ps1 1.0.0
+.\scripts\pack-release.ps1 1.0.0
+```
+
+Linux:
+
+```bash
+docker login
+./scripts/build-and-push.sh 1.0.0
+./scripts/pack-release.sh 1.0.0
 ```
 
 ## Required environment
 
-- `MENDR_CONTROL_PLANE_URL` - cloud or on-prem control plane base URL
-- `GATEWAY_INTERNAL_API_KEY` - shared internal API key used for forwarded/internal calls
+- `MENDR_CONTROL_PLANE_URL` — cloud control plane base URL
+- `GATEWAY_INTERNAL_API_KEY` — shared internal API key (must match control plane)
 
-## Notes
+## Endpoints (via edge)
 
-- Redis is local and persistent via AOF.
-- This repository intentionally does not include Postgres, Kafka, AI analysis, or the dashboard.
+- `POST /api/gateway/proxy`
+- `POST /api/services`
+- `POST /api/services/{name}/contracts`
+- `GET /health`
+
+Registration and sync calls are forwarded to the Mendr control plane; proxy hot path stays local.
