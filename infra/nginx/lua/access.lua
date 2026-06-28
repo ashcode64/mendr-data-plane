@@ -242,10 +242,29 @@ if origin and route_config.originOverrides and type(route_config.originOverrides
     end
 end
 
--- Request transforms
+-- Request transforms — independent protected-path backstop (§3) + fail-open (§4.11)
 if route_config.requestProgram then
-    payload = transform.apply_program(transform.shallow_copy(payload), route_config.requestProgram)
-    ngx.ctx.requestPayload = payload
+    local violation = transform.protected_violation(
+        route_config.requestProgram, route_config.protectedPaths)
+    if violation then
+        -- Defense-in-depth: refuse the WHOLE program and forward the original
+        -- payload unmodified. Independent of the control-plane guardrail.
+        ngx.log(ngx.ERR, "access: REFUSING request program — touches protected path '",
+            violation, "' for ", source_service, "->", target_service, endpoint)
+        ngx.ctx.protectedPathViolation = violation
+    else
+        local ok, result = pcall(transform.apply_program,
+            transform.shallow_copy(payload), route_config.requestProgram)
+        if ok and result ~= nil then
+            payload = result
+            ngx.ctx.requestPayload = payload
+        else
+            -- Fail-open: a malformed/erroring program must never block live traffic.
+            ngx.log(ngx.ERR, "access: request transform errored, forwarding original "
+                .. "(fail-open): ", tostring(result))
+            ngx.ctx.patchApplyError = true
+        end
+    end
 end
 
 local target_base = config.rewrite_localhost(route_config.targetBaseUrl)
