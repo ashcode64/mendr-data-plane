@@ -48,6 +48,29 @@ local function hits_protected(target, protected)
     return false
 end
 
+-- Recursively scan a MendrScript ops[] AST (snapshot v2) for protected-path hits.
+-- Walks path/from/to on every op, the predicate path, AND both conditional
+-- branches (Gap 7) — a protected path hidden inside a branch that only fires on
+-- certain inputs is still rejected. `then` is a Lua keyword, hence bracket access.
+local function scan_ops(ops, protected)
+    if type(ops) ~= "table" then return nil end
+    for _, op in ipairs(ops) do
+        if type(op) == "table" then
+            local h = hits_protected(op.path, protected)
+                or hits_protected(op.from, protected)
+                or hits_protected(op.to, protected)
+            if h then return h end
+            if type(op.predicate) == "table" then
+                h = hits_protected(op.predicate.path, protected)
+                if h then return h end
+            end
+            h = scan_ops(op["then"], protected) or scan_ops(op.otherwise, protected)
+            if h then return h end
+        end
+    end
+    return nil
+end
+
 -- Returns the first protected target a program would touch, or nil if clean.
 -- `extra` (optional array of strings) augments the hardcoded blacklist.
 function _M.protected_violation(program, extra)
@@ -118,6 +141,10 @@ function _M.protected_violation(program, extra)
     if hp then return hp end
     local h = hits_protected(program.wrapKey, protected) or hits_protected(program.unwrapKey, protected)
     if h then return h end
+
+    -- Snapshot v2: closed-opcode AST (recursively, including conditional branches).
+    local ho = scan_ops(program.ops, protected)
+    if ho then return ho end
 
     return nil
 end
@@ -376,6 +403,327 @@ end
 -- as a parse failure (fail-closed), preventing absurd dates from a misread value.
 local DATE_EPOCH_MAX = 4102444800
 
+-- ════════════════════════════════════════════════════════════════════════════
+-- MendrScript closed-opcode interpreter (snapshot v2 `ops[]`)
+-- ════════════════════════════════════════════════════════════════════════════
+-- The AST is DATA the interpreter walks — never code, no load()/FFI. Semantics
+-- mirror the Java MendrScriptExecutor exactly (the differential conformance suite
+-- diffs the two). Value-op faults and post-condition violations raise a Lua error;
+-- _M.apply_ops catches it and FAILS CLOSED (returns the payload unmodified) so a
+-- silently-wrong value is never emitted.
+
+-- Deep copy so a faulting program can be abandoned without partial mutation.
+-- JSON_NULL identity must be preserved (it is a sentinel, not a plain table).
+local function deep_copy(v)
+    if v == JSON_NULL or type(v) ~= "table" then return v end
+    local out = {}
+    for k, val in pairs(v) do out[k] = deep_copy(val) end
+    return out
+end
+
+local function as_str(v)
+    if v == nil or v == JSON_NULL then return "" end
+    if type(v) == "boolean" then return v and "true" or "false" end
+    return tostring(v)
+end
+
+-- Strict numeric parse (string/number only); nil on failure (caller fails closed).
+local function to_number_strict(v)
+    if type(v) == "number" then return v end
+    if type(v) == "string" then
+        local trimmed = v:match("^%s*(.-)%s*$")
+        return tonumber(trimmed)
+    end
+    return nil
+end
+
+-- Integral doubles -> integers so cjson encodes them like the Java Long path.
+local function norm_num(n)
+    if n == math.floor(n) and n ~= math.huge and n ~= -math.huge then
+        return math.floor(n)
+    end
+    return n
+end
+
+local function assert_bounds(res, mn, mx)
+    if res ~= res or res == math.huge or res == -math.huge then
+        error("non-finite result")
+    end
+    mn, mx = tonumber(mn), tonumber(mx)
+    if mn ~= nil and res < mn then error("post-condition: below expectedMin") end
+    if mx ~= nil and res > mx then error("post-condition: above expectedMax") end
+end
+
+local function to_bool(v)
+    if type(v) == "boolean" then return v end
+    local s = as_str(v):lower()
+    return s == "true" or s == "1" or s == "yes"
+end
+
+local function coerce_strict(v, t)
+    if t == "string" then
+        return as_str(v)
+    elseif t == "integer" or t == "int" or t == "long" then
+        local n = to_number_strict(v); if n == nil then error("coerce: not a number") end
+        return math.floor(n + 0.5)
+    elseif t == "number" or t == "double" or t == "float" then
+        local n = to_number_strict(v); if n == nil then error("coerce: not a number") end
+        return n
+    elseif t == "boolean" then
+        return to_bool(v)
+    end
+    error("coerce: unknown target type")
+end
+
+-- Literal (non-pattern) string replace, matching Java String.replace.
+local function literal_replace(s, find, repl)
+    find = find or ""
+    if find == "" then return s end
+    local parts, i = {}, 1
+    while true do
+        local st, en = s:find(find, i, true)
+        if not st then parts[#parts + 1] = s:sub(i); break end
+        parts[#parts + 1] = s:sub(i, st - 1)
+        parts[#parts + 1] = repl or ""
+        i = en + 1
+    end
+    return table.concat(parts)
+end
+
+-- ── named-format matchers (mirror NamedFormats.java) ─────────────────────────
+local function fmt_email(s) return s:match("^[^@%s]+@[^@%s]+%.[^@%s]+$") ~= nil end
+local function fmt_uuid(s)
+    return s:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
+end
+local function fmt_iso_date(s) return s:match("^%d%d%d%d%-%d%d%-%d%d$") ~= nil end
+local function fmt_iso_datetime(s)
+    if not s:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d") then return false end
+    local rest = s:sub(20):gsub("^%.%d+", "")
+    if rest == "" or rest == "Z" then return true end
+    return rest:match("^[+-]%d%d:?%d%d$") ~= nil
+end
+local function fmt_e164(s)
+    local d = s:match("^%+([1-9]%d*)$")
+    return d ~= nil and #d >= 2 and #d <= 15
+end
+local function fmt_slug(s)
+    if s == "" or s:match("[^a-z0-9%-]") then return false end
+    if s:sub(1, 1) == "-" or s:sub(-1) == "-" or s:find("%-%-") then return false end
+    return true
+end
+local function fmt_numeric(s)
+    return (s:match("^%-?%d+$") or s:match("^%-?%d+%.%d+$")) ~= nil
+end
+local function fmt_alnum(s) return s:match("^[%a%d]+$") ~= nil end
+
+local NAMED_FORMATS = {
+    email = fmt_email, uuid = fmt_uuid, iso_date = fmt_iso_date,
+    iso_datetime = fmt_iso_datetime, e164 = fmt_e164, slug = fmt_slug,
+    numeric = fmt_numeric, alnum = fmt_alnum,
+}
+
+local function matches_format(fmt, value)
+    local fn = NAMED_FORMATS[fmt]
+    if not fn then return false end
+    return fn(as_str(value))
+end
+
+-- ── structured predicate evaluation (Gap 3, Option C — no free-form regex) ────
+local function eval_predicate(pred, payload)
+    local raw = _M.get_path(payload, pred.path)
+    local exists = raw ~= nil
+    local op = pred.op
+    if op == "exists" then return exists end
+    if not exists then return false end
+    local val = (raw == JSON_NULL) and nil or raw
+    if op == "eq" then
+        return as_str(val) == as_str(pred.value)
+    elseif op == "in" then
+        if type(pred.values) ~= "table" then return false end
+        for _, x in ipairs(pred.values) do
+            if as_str(val) == as_str(x) then return true end
+        end
+        return false
+    elseif op == "matches_format" then
+        return matches_format(pred.format, val)
+    elseif op == "starts_with" then
+        local v, s = pred.value or "", as_str(val)
+        return s:sub(1, #v) == v
+    elseif op == "ends_with" then
+        local v, s = pred.value or "", as_str(val)
+        return v == "" or s:sub(-#v) == v
+    elseif op == "contains" then
+        return as_str(val):find(pred.value or "", 1, true) ~= nil
+    elseif op == "length_between" then
+        local L = #as_str(val)
+        return (pred.min == nil or L >= pred.min) and (pred.max == nil or L <= pred.max)
+    end
+    return false
+end
+
+-- ── per-opcode application (raises on value-op fault -> fail-closed) ──────────
+local function apply_op(payload, op)
+    local kind = op.op
+    if kind == "rename" or kind == "move" then
+        local v = _M.get_path(payload, op.from)
+        if v ~= nil then
+            _M.set_path(payload, op.to, v)
+            if op.from ~= op.to then _M.delete_path(payload, op.from) end
+        end
+        return payload
+    elseif kind == "copy" then
+        local v = _M.get_path(payload, op.from)
+        if v ~= nil then _M.set_path(payload, op.to, v) end
+        return payload
+    elseif kind == "remove" then
+        _M.delete_path(payload, op.path)
+        return payload
+    elseif kind == "wrap" then
+        return { [op.key] = payload }
+    elseif kind == "unwrap" then
+        if type(payload) == "table" and payload[op.key] ~= nil then return payload[op.key] end
+        return payload
+    elseif kind == "wrap_array" then
+        local v = _M.get_path(payload, op.path)
+        if v ~= nil then _M.set_path(payload, op.path, { v }) end
+        return payload
+    elseif kind == "unwrap_array" then
+        local v = _M.get_path(payload, op.path)
+        if type(v) == "table" and v[1] ~= nil and #v == 1 then
+            _M.set_path(payload, op.path, v[1])
+        end
+        return payload
+    elseif kind == "strip_unknown" then
+        local p = op.path
+        local node = (p == nil or p == "" or p == "/") and payload or _M.get_path(payload, p)
+        if type(node) == "table" and type(op.allowed) == "table" then
+            local allow = {}
+            for _, k in ipairs(op.allowed) do allow[k] = true end
+            for k in pairs(node) do
+                if type(k) == "string" and not allow[k] then node[k] = nil end
+            end
+        end
+        return payload
+    elseif kind == "default" then
+        local v = _M.get_path(payload, op.path)
+        local exists = v ~= nil
+        local is_null = exists and v == JSON_NULL
+        local on = as_str(op.on):upper()
+        if on == "" then on = "ABSENT" end
+        local fire = (on == "ABSENT" and not exists)
+            or (on == "NULL" and is_null)
+            or (on == "BOTH" and (not exists or is_null))
+        if fire then _M.set_path(payload, op.path, op.value) end
+        return payload
+    elseif kind == "coalesce" then
+        if _M.get_path(payload, op.path) == JSON_NULL then
+            _M.set_path(payload, op.path, op.value)
+        end
+        return payload
+    elseif kind == "coerce" then
+        local v = _M.get_path(payload, op.path)
+        if v == nil then return payload end
+        _M.set_path(payload, op.path, coerce_strict((v == JSON_NULL) and nil or v, op.targetType))
+        return payload
+    elseif kind == "scale" then
+        local v = _M.get_path(payload, op.path)
+        if v == nil then return payload end
+        local n = to_number_strict((v == JSON_NULL) and nil or v)
+        if n == nil then error("scale: not a number") end
+        local den = tonumber(op.denominator)
+        if den == nil or den == 0 then error("scale: denominator zero") end
+        local res = n * (tonumber(op.numerator) or 0) / den
+        assert_bounds(res, op.expectedMin, op.expectedMax)
+        _M.set_path(payload, op.path, norm_num(res))
+        return payload
+    elseif kind == "arith" then
+        local v = _M.get_path(payload, op.path)
+        if v == nil then return payload end
+        local n = to_number_strict((v == JSON_NULL) and nil or v)
+        if n == nil then error("arith: not a number") end
+        local operand = tonumber(op.operand) or 0
+        local res
+        local oper = op.operator
+        if oper == "+" then res = n + operand
+        elseif oper == "-" then res = n - operand
+        elseif oper == "*" then res = n * operand
+        elseif oper == "/" then
+            if operand == 0 then error("arith: divide by zero") end
+            res = n / operand
+        else error("arith: bad operator") end
+        assert_bounds(res, op.expectedMin, op.expectedMax)
+        _M.set_path(payload, op.path, norm_num(res))
+        return payload
+    elseif kind == "map_value" then
+        local v = _M.get_path(payload, op.path)
+        if v == nil then return payload end
+        local key = as_str((v == JSON_NULL) and nil or v)
+        if type(op.mapping) == "table" and op.mapping[key] ~= nil then
+            _M.set_path(payload, op.path, op.mapping[key])
+            return payload
+        end
+        if (op.onUnmapped or "reject") == "passthrough" then return payload end
+        error("map_value: unmapped value")
+    elseif kind == "reformat_date" then
+        local v = _M.get_path(payload, op.path)
+        if v == nil then return payload end
+        local assume_off = parse_offset_ms(op.tzPolicy) or 0
+        local ms = date_to_epoch_ms((v == JSON_NULL) and nil or v, op.sourceFormat, assume_off)
+        if ms == nil then error("reformat_date: parse failure") end
+        -- Bounded validity window (fail-closed), same guard the legacy bucket applies;
+        -- also keeps os.date away from negative epochs (platform-undefined).
+        local secs = ms / 1000
+        if secs < 0 or secs > DATE_EPOCH_MAX then error("reformat_date: out of validity window") end
+        local out = epoch_ms_to_date(ms, op.targetFormat)
+        if out == nil then error("reformat_date: format failure") end
+        _M.set_path(payload, op.path, out)
+        return payload
+    elseif kind == "string" then
+        local v = _M.get_path(payload, op.path)
+        if v == nil then return payload end
+        local s = as_str((v == JSON_NULL) and nil or v)
+        local args = op.args or {}
+        local oper, out = op.operation, nil
+        if oper == "lower" then out = s:lower()
+        elseif oper == "upper" then out = s:upper()
+        elseif oper == "trim" then out = s:match("^%s*(.-)%s*$")
+        elseif oper == "prepend" then out = as_str(args[1] or "") .. s
+        elseif oper == "append" then out = s .. as_str(args[1] or "")
+        elseif oper == "replace" then out = literal_replace(s, as_str(args[1] or ""), as_str(args[2] or ""))
+        else error("string: bad operation") end
+        _M.set_path(payload, op.path, out)
+        return payload
+    elseif kind == "conditional" then
+        local branch = eval_predicate(op.predicate or {}, payload)
+        local chosen = branch and op["then"] or op.otherwise
+        if type(chosen) == "table" then
+            local cur = payload
+            for _, child in ipairs(chosen) do
+                if type(child) == "table" then cur = apply_op(cur, child) end
+            end
+            return cur
+        end
+        return payload
+    end
+    error("unknown opcode: " .. tostring(kind))
+end
+
+-- Run a closed-opcode program over a fresh copy of `payload`. Any op fault makes
+-- the WHOLE program fail closed: the original payload is returned unmodified.
+function _M.apply_ops(payload, ops)
+    if type(ops) ~= "table" or #ops == 0 then return payload end
+    local work = deep_copy(payload)
+    local ok, result = pcall(function()
+        local cur = work
+        for _, op in ipairs(ops) do
+            if type(op) == "table" then cur = apply_op(cur, op) end
+        end
+        return cur
+    end)
+    if ok then return result end
+    return payload
+end
+
 function _M.apply_program(payload, program)
     if not program or program.empty then
         return payload
@@ -573,6 +921,12 @@ function _M.apply_program(payload, program)
 
     if program.unwrapKey and type(payload[program.unwrapKey]) == "table" then
         payload = payload[program.unwrapKey]
+    end
+
+    -- Snapshot v2: closed-opcode MendrScript program. DSL programs carry their
+    -- logic here (legacy buckets empty); a fault fails closed for the whole program.
+    if program.ops and type(program.ops) == "table" and #program.ops > 0 then
+        payload = _M.apply_ops(payload, program.ops)
     end
 
     return payload

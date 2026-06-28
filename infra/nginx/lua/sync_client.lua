@@ -11,6 +11,12 @@ local sync_dict = ngx.shared.mendr_sync_state
 local POLL_TIMEOUT_MS   = 35000  -- control plane holds up to 30s
 local ERROR_BACKOFF_SEC = 5
 
+-- Capabilities this edge advertises to the control plane (Gap 10). "v2" means this
+-- build runs the closed-opcode MendrScript interpreter (snapshot v2 `ops[]`). The
+-- control plane withholds v2-only (DSL) routes from edges that do NOT advertise it,
+-- rather than shipping a snapshot the edge would silently no-op.
+local EDGE_CAPS = "v2"
+
 local function redis_connect()
     local red = redis:new()
     red:set_timeouts(1000, 1000, 1000)
@@ -80,6 +86,7 @@ local function schedule_poll(delay_sec)
         local last_version = sync_dict:get("last_version") or "0"
         local url = config.control_plane_base()
             .. "/v1/sync/routeconfig?since=" .. ngx.escape_uri(last_version)
+            .. "&caps=" .. ngx.escape_uri(EDGE_CAPS)
 
         local httpc = http.new()
         httpc:set_timeout(POLL_TIMEOUT_MS)
