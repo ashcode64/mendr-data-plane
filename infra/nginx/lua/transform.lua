@@ -562,8 +562,22 @@ local function eval_predicate(pred, payload)
 end
 
 -- ── per-opcode application (raises on value-op fault -> fail-closed) ──────────
+local function log_transform_err(msg)
+    if ngx and ngx.log then
+        ngx.log(ngx.ERR, msg)
+    end
+end
+
 local function apply_op(payload, op)
     local kind = op.op
+    if kind == nil or kind == "" then
+        local detail = "missing opcode on MendrScript op entry (edge cannot dispatch)"
+        if ok_cjson and cjson then
+            local encoded = cjson.encode(op)
+            if encoded then detail = detail .. ": " .. encoded end
+        end
+        error(detail)
+    end
     if kind == "rename" or kind == "move" then
         local v = _M.get_path(payload, op.from)
         if v ~= nil then
@@ -721,6 +735,7 @@ function _M.apply_ops(payload, ops)
         return cur
     end)
     if ok then return result end
+    log_transform_err("transform: MendrScript program failed closed: " .. tostring(result))
     return payload
 end
 

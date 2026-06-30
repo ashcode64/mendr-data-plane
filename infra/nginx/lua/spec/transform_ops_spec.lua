@@ -176,6 +176,38 @@ do
     check("trim leaves non-ascii whitespace (NBSP)", nb.s == "\194\160hi\194\160")
 end
 
+-- 16) rename + move: nested transmission_id -> root tag_sent (shipping-service scenario)
+do
+    local nested = {
+        obj_id = {
+            item_id = {
+                transmission_id = "TXN-ORD-A1B2C3D4E5-20260626120000",
+            },
+        },
+    }
+    local out = T.apply_program(nested, prog({
+        { op = "rename", from = "/obj_id/item_id/transmission_id", to = "/obj_id/item_id/tag_sent" },
+        { op = "move", from = "/obj_id/item_id/tag_sent", to = "/tag_sent" },
+    }))
+    check("rename+move lifts tag_sent to root", out.tag_sent == "TXN-ORD-A1B2C3D4E5-20260626120000")
+    check("rename+move prunes empty nesting", out.obj_id == nil)
+end
+
+-- 17) ops missing 'op' discriminator fail closed (original payload preserved)
+do
+    local nested = {
+        obj_id = {
+            item_id = {
+                transmission_id = "TXN-123",
+            },
+        },
+    }
+    local out = T.apply_program(nested, prog({
+        { from = "/obj_id/item_id/transmission_id", to = "/obj_id/item_id/tag_sent" },
+    }))
+    check("missing op fails closed", out.obj_id.item_id.transmission_id == "TXN-123")
+end
+
 print(string.rep("-", 40))
 if failures == 0 then
     print("ALL PASSED")
