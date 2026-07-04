@@ -68,6 +68,13 @@ if not program.streamable and not program.wrapKey and not program.unwrapKey then
     if program.coercions and next(program.coercions) then has_flat_ops = true end
     if program.removals and type(program.removals) == "table" and #program.removals > 0 then has_flat_ops = true end
     if program.moves and type(program.moves) == "table" and #program.moves > 0 then has_flat_ops = true end
+    if program.scales and type(program.scales) == "table" and #program.scales > 0 then has_flat_ops = true end
+    if program.coalesce and type(program.coalesce) == "table" and #program.coalesce > 0 then has_flat_ops = true end
+    if program.valueMaps and type(program.valueMaps) == "table" and #program.valueMaps > 0 then has_flat_ops = true end
+    if program.dateFormats and type(program.dateFormats) == "table" and #program.dateFormats > 0 then has_flat_ops = true end
+    if program.stripUnknown and type(program.stripUnknown) == "table" and #program.stripUnknown > 0 then has_flat_ops = true end
+    if program.wrapArrays and type(program.wrapArrays) == "table" and #program.wrapArrays > 0 then has_flat_ops = true end
+    if program.unwrapArrays and type(program.unwrapArrays) == "table" and #program.unwrapArrays > 0 then has_flat_ops = true end
 
     if not has_flat_ops then
         ngx.ctx.transformedResponseBody = raw_body
@@ -76,7 +83,25 @@ if not program.streamable and not program.wrapKey and not program.unwrapKey then
     end
 end
 
-local transformed = transform.apply_program(transform.shallow_copy(raw_body), program)
+-- Independent protected-path backstop (§3) + fail-open (§4.11), response side.
+local route_config = ngx.ctx.routeConfig
+local violation = transform.protected_violation(
+    program, route_config and route_config.protectedPaths)
+if violation then
+    ngx.log(ngx.ERR, "body_filter: REFUSING response program — touches protected path '",
+        violation, "'")
+    ngx.ctx.protectedPathViolation = violation
+    ngx.arg[1] = full_body
+    return
+end
+
+local ok, transformed = pcall(transform.apply_program, transform.shallow_copy(raw_body), program)
+if not ok or transformed == nil then
+    ngx.log(ngx.ERR, "body_filter: response transform errored, passing original "
+        .. "(fail-open): ", tostring(transformed))
+    ngx.arg[1] = full_body
+    return
+end
 ngx.ctx.transformedResponseBody = transformed
 
 local encoded, encode_err = cjson.encode(transformed)
