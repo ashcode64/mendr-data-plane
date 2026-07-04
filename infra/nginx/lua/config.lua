@@ -27,6 +27,28 @@ function _M.internal_api_key()
     return key
 end
 
+--- Per-tenant edge API key ("<prefix>.<secret>"), issued by the control plane and
+--- mapped to exactly one tenant. Presenting it makes the control plane resolve the
+--- tenant server-side and return ONLY that tenant's route snapshots. This is the
+--- SaaS multi-tenant edge credential; prefer it over the shared internal key.
+function _M.edge_api_key()
+    local key = os.getenv("GATEWAY_EDGE_API_KEY")
+    if key == nil or key == "" then
+        return nil
+    end
+    return key
+end
+
+--- Optional tenant id sent as a defense-in-depth cross-check header. The control
+--- plane authoritatively derives the tenant from the API key; this must match.
+function _M.tenant_id()
+    local id = os.getenv("MENDR_TENANT_ID")
+    if id == nil or id == "" then
+        return nil
+    end
+    return id
+end
+
 function _M.docker_host_rewrite()
     local rewrite = os.getenv("MENDR_DOCKER_HOST_REWRITE")
     if rewrite == nil or rewrite == "" then

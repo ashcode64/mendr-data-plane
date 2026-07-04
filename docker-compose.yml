@@ -10,6 +10,11 @@ services:
       MENDR_REDIS_PORT: "6379"
       MENDR_JAVA_FALLBACK: "false"
       MENDR_DOCKER_HOST_REWRITE: ${MENDR_DOCKER_HOST_REWRITE:-host.docker.internal}
+      # Per-tenant SaaS edge credential (preferred). Control plane resolves the
+      # tenant from this key and scopes the route snapshot to it.
+      GATEWAY_EDGE_API_KEY: ${GATEWAY_EDGE_API_KEY:-}
+      MENDR_TENANT_ID: ${MENDR_TENANT_ID:-}
+      # Shared internal key: backward-compat for legacy/single-tenant edges.
       GATEWAY_INTERNAL_API_KEY: ${GATEWAY_INTERNAL_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"

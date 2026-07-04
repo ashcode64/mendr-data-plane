@@ -92,6 +92,19 @@ local function schedule_poll(delay_sec)
         httpc:set_timeout(POLL_TIMEOUT_MS)
 
         local headers = { ["Accept"] = "application/json" }
+        -- Per-tenant edge credential (SaaS): the control plane resolves the tenant
+        -- from this key and scopes the sync payload to that tenant. Preferred.
+        local edge_key = config.edge_api_key()
+        if edge_key then
+            headers["X-Api-Key"] = edge_key
+        end
+        -- Optional defense-in-depth cross-check; the key remains authoritative.
+        local tenant = config.tenant_id()
+        if tenant then
+            headers["X-Tenant-Id"] = tenant
+        end
+        -- Shared internal key kept for backward compatibility during rollout (used
+        -- by legacy/single-tenant edges that have no per-tenant key yet).
         local api_key = config.internal_api_key()
         if api_key then
             headers["X-Internal-Api-Key"] = api_key
