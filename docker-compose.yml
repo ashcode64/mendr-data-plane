@@ -16,6 +16,8 @@ services:
       MENDR_TENANT_ID: ${MENDR_TENANT_ID:-}
       # Shared internal key: backward-compat for legacy/single-tenant edges.
       GATEWAY_INTERNAL_API_KEY: ${GATEWAY_INTERNAL_API_KEY:-}
+      # Periodic full route-config resync backstop (seconds). 0 disables.
+      MENDR_FULL_RESYNC_INTERVAL_SEC: ${MENDR_FULL_RESYNC_INTERVAL_SEC:-300}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

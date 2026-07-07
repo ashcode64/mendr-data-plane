@@ -10,6 +10,7 @@ local sync_dict = ngx.shared.mendr_sync_state
 
 local POLL_TIMEOUT_MS   = 35000  -- control plane holds up to 30s
 local ERROR_BACKOFF_SEC = 5
+local FULL_RESYNC_KEY   = "last_full_resync_at"
 
 -- Capabilities this edge advertises to the control plane (Gap 10). "v2" means this
 -- build runs the closed-opcode MendrScript interpreter (snapshot v2 `ops[]`). The
@@ -84,6 +85,18 @@ local function schedule_poll(delay_sec)
         end
 
         local last_version = sync_dict:get("last_version") or "0"
+        local pending_full_resync = false
+        local full_interval = config.full_resync_interval_sec()
+        if full_interval > 0 then
+            local now = ngx.time()
+            local last_full = tonumber(sync_dict:get(FULL_RESYNC_KEY) or "0") or 0
+            if now - last_full >= full_interval then
+                last_version = "0"
+                pending_full_resync = true
+                ngx.log(ngx.INFO, "sync_client: forcing periodic full resync (interval=", full_interval, "s)")
+            end
+        end
+
         local url = config.control_plane_base()
             .. "/v1/sync/routeconfig?since=" .. ngx.escape_uri(last_version)
             .. "&caps=" .. ngx.escape_uri(EDGE_CAPS)
@@ -134,6 +147,10 @@ local function schedule_poll(delay_sec)
                 ngx.log(ngx.WARN, "sync_client: apply failed: ", apply_err)
                 schedule_poll(ERROR_BACKOFF_SEC)
                 return
+            end
+
+            if pending_full_resync then
+                sync_dict:set(FULL_RESYNC_KEY, tostring(ngx.time()))
             end
 
             schedule_poll(0)

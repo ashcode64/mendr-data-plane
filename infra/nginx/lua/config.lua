@@ -57,6 +57,19 @@ function _M.docker_host_rewrite()
     return rewrite
 end
 
+--- Interval between forced full resyncs (seconds). 0 disables the backstop.
+function _M.full_resync_interval_sec()
+    local raw = os.getenv("MENDR_FULL_RESYNC_INTERVAL_SEC")
+    if raw == nil or raw == "" then
+        return 300
+    end
+    local n = tonumber(raw)
+    if n == nil or n < 0 then
+        return 300
+    end
+    return n
+end
+
 --- Rewrite localhost / 127.0.0.1 so OpenResty inside Docker can reach host-run services.
 function _M.rewrite_localhost(url)
     if url == nil or url == "" then
