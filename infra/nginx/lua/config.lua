@@ -27,12 +27,47 @@ function _M.internal_api_key()
     return key
 end
 
+--- Per-tenant edge API key ("<prefix>.<secret>"), issued by the control plane and
+--- mapped to exactly one tenant. Presenting it makes the control plane resolve the
+--- tenant server-side and return ONLY that tenant's route snapshots. This is the
+--- SaaS multi-tenant edge credential; prefer it over the shared internal key.
+function _M.edge_api_key()
+    local key = os.getenv("GATEWAY_EDGE_API_KEY")
+    if key == nil or key == "" then
+        return nil
+    end
+    return key
+end
+
+--- Optional tenant id sent as a defense-in-depth cross-check header. The control
+--- plane authoritatively derives the tenant from the API key; this must match.
+function _M.tenant_id()
+    local id = os.getenv("MENDR_TENANT_ID")
+    if id == nil or id == "" then
+        return nil
+    end
+    return id
+end
+
 function _M.docker_host_rewrite()
     local rewrite = os.getenv("MENDR_DOCKER_HOST_REWRITE")
     if rewrite == nil or rewrite == "" then
         return nil
     end
     return rewrite
+end
+
+--- Interval between forced full resyncs (seconds). 0 disables the backstop.
+function _M.full_resync_interval_sec()
+    local raw = os.getenv("MENDR_FULL_RESYNC_INTERVAL_SEC")
+    if raw == nil or raw == "" then
+        return 300
+    end
+    local n = tonumber(raw)
+    if n == nil or n < 0 then
+        return 300
+    end
+    return n
 end
 
 --- Rewrite localhost / 127.0.0.1 so OpenResty inside Docker can reach host-run services.
