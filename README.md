@@ -30,9 +30,42 @@ docker compose up -d --build
   the control plane. Presenting it makes the control plane resolve the tenant and
   return ONLY that tenant's route snapshots. This is the multi-tenant SaaS credential.
 - `MENDR_TENANT_ID` - (optional) the tenant UUID, sent as a defense-in-depth
-  cross-check header (`X-Tenant-Id`). The API key remains authoritative.
+  cross-check header (`X-Tenant-Id`). Also enforced on ingress API-key / host
+  identity resolution (tenant mismatch → 401).
 - `GATEWAY_INTERNAL_API_KEY` - shared internal API key. Kept for backward
   compatibility for legacy/single-tenant edges that do not yet have a per-tenant key.
+
+### Transparent ingress (Phase 6)
+
+- `MENDR_INGRESS_ENABLED=true` — enable the catch-all ingress location.
+- `MENDR_HOST_IDENTITY_FALLBACK` — when unset, follows ingress enabled. Host
+  fallback uses synced `mendr:hostident:{host}` if `X-Mendr-Key` is absent.
+- `MENDR_TLS_REQUIRED=true` — reject non-HTTPS ingress (except ACME HTTP-01).
+- `MENDR_ACME_ENABLED=true` — in-edge Let's Encrypt via `lua-resty-acme`.
+  When false/unset, **:443 does not listen** (entrypoint skips installing the
+  HTTPS server). When true, exposes `:443` with ACME + fallback cert until
+  issuance succeeds.
+- `MENDR_ACME_EMAIL` — ACME account email (required when ACME on).
+- `MENDR_ACME_DOMAINS` — comma-separated hostname allowlist for this edge
+  (CNAME your customer hosts here; isolation is per-edge allowlist).
+- `MENDR_ACME_STAGING=true` — use Let's Encrypt staging (recommended first).
+
+**CNAME onboarding:** point `api.customer.com` → this edge's public hostname
+(A/AAAA or CNAME). Register host identity:
+
+```http
+POST /api/services/ingress-host-identity
+{ "host": "api.customer.com", "sourceService": "order-service" }
+```
+
+Issue an ingress key (or rely on host fallback):
+
+```http
+POST /api/services/ingress-api-keys
+{ "sourceService": "order-service" }
+```
+
+Expose ports **80** (HTTP-01) and **443** (HTTPS) when ACME is enabled.
 
 ## Multi-tenant edge onboarding (SaaS)
 

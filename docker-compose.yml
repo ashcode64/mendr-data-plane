@@ -4,6 +4,8 @@ services:
     image: mendr/data-plane:latest
     ports:
       - "8080:8080"
+      - "80:80"
+      - "443:443"
     environment:
       MENDR_CONTROL_PLANE_URL: ${MENDR_CONTROL_PLANE_URL:-https://api.mendr.io}
       MENDR_REDIS_HOST: mendr-edge-redis
@@ -18,6 +20,12 @@ services:
       GATEWAY_INTERNAL_API_KEY: ${GATEWAY_INTERNAL_API_KEY:-}
       # Periodic full route-config resync backstop (seconds). 0 disables.
       MENDR_FULL_RESYNC_INTERVAL_SEC: ${MENDR_FULL_RESYNC_INTERVAL_SEC:-300}
+      MENDR_INGRESS_ENABLED: ${MENDR_INGRESS_ENABLED:-false}
+      MENDR_TLS_REQUIRED: ${MENDR_TLS_REQUIRED:-false}
+      MENDR_ACME_ENABLED: ${MENDR_ACME_ENABLED:-false}
+      MENDR_ACME_EMAIL: ${MENDR_ACME_EMAIL:-}
+      MENDR_ACME_DOMAINS: ${MENDR_ACME_DOMAINS:-}
+      MENDR_ACME_STAGING: ${MENDR_ACME_STAGING:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -32,6 +40,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - mendr-mesh
 
   mendr-edge-redis:
     image: redis:7-alpine
@@ -45,6 +55,12 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - mendr-mesh
 
 volumes:
   mendr_redis_data:
+
+networks:
+  mendr-mesh:
+    name: mendr-mesh

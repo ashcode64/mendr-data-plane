@@ -16,7 +16,10 @@ local FULL_RESYNC_KEY   = "last_full_resync_at"
 -- build runs the closed-opcode MendrScript interpreter (snapshot v2 `ops[]`). The
 -- control plane withholds v2-only (DSL) routes from edges that do NOT advertise it,
 -- rather than shipping a snapshot the edge would silently no-op.
-local EDGE_CAPS = "v2"
+-- "v2" = MendrScript closed-opcode interpreter; "ingress" = transparent HTTP
+-- ingress + radixtree routing tables. Control plane withholds features the edge
+-- does not advertise.
+local EDGE_CAPS = "v2,ingress"
 
 local function redis_connect()
     local red = redis:new()
@@ -72,7 +75,63 @@ local function apply_sync_payload(payload)
         end
     end
 
+    -- Ingress tables: apply BEFORE bumping last_version so the radixtree and
+    -- routeconfig snapshots stay atomic on the same sync version.
+    local ingress_tables = payload.ingressTables
+    if type(ingress_tables) == "table" then
+        local encoded = cjson.encode(ingress_tables)
+        if encoded then
+            local ok_set, set_err = red:set("mendr:ingress:tables", encoded)
+            if not ok_set then
+                redis_close(red)
+                return false, "redis SET mendr:ingress:tables failed: " .. (set_err or "unknown")
+            end
+        end
+    end
+
+    -- Ingress API keys (prefix → {keyHash, sourceService, tenantId, ...})
+    local api_keys = payload.apiKeys
+    if type(api_keys) == "table" then
+        for key, value in pairs(api_keys) do
+            if type(key) == "string" and type(value) == "string" then
+                red:set(key, value)
+            end
+        end
+    end
+
+    -- Host identity fallback (host → {sourceService, tenantId})
+    local host_ident = payload.hostIdentity
+    if type(host_ident) == "table" then
+        for key, value in pairs(host_ident) do
+            if type(key) == "string" and type(value) == "string" then
+                red:set(key, value)
+            end
+        end
+    end
+
     redis_close(red)
+
+    -- Rebuild radixtrees from the just-written tables + route keys
+    -- (last-known-good on failure).
+    local ok_req, ingress_rt = pcall(require, "ingress_routing")
+    if ok_req and ingress_rt then
+        if type(ingress_tables) == "table" then
+            local ok_rebuild, rebuild_err = ingress_rt.rebuild(ingress_tables, version)
+            if not ok_rebuild then
+                ngx.log(ngx.WARN, "sync_client: ingress radixtree rebuild failed (keeping last-known-good): ",
+                    tostring(rebuild_err))
+            end
+        end
+        -- Pair trees for envelope-path template lookup (retire KEYS scan).
+        if type(routes) == "table" then
+            local ok_pairs, pairs_err = ingress_rt.rebuild_pairs_from_route_keys(routes, version)
+            if not ok_pairs then
+                ngx.log(ngx.WARN, "sync_client: pair radixtree rebuild failed (keeping last-known-good): ",
+                    tostring(pairs_err))
+            end
+        end
+    end
+
     sync_dict:set("last_version", tostring(version))
     ngx.log(ngx.INFO, "sync_client: applied routeconfig sync version ", version)
     return true

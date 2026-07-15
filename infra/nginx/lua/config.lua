@@ -70,6 +70,76 @@ function _M.full_resync_interval_sec()
     return n
 end
 
+--- Transparent HTTP ingress (OpenAPI base-URL swap). Off by default.
+function _M.ingress_enabled()
+    local flag = os.getenv("MENDR_INGRESS_ENABLED")
+    return flag == "true" or flag == "1"
+end
+
+--- When true and X-Mendr-Key is absent, resolve identity from Host via
+--- mendr:hostident:{host} (Phase 6). Default on when ingress is enabled.
+function _M.host_identity_fallback_enabled()
+    local flag = os.getenv("MENDR_HOST_IDENTITY_FALLBACK")
+    if flag == "false" or flag == "0" then
+        return false
+    end
+    if flag == "true" or flag == "1" then
+        return true
+    end
+    return _M.ingress_enabled()
+end
+
+--- Reject non-HTTPS ingress traffic (except ACME HTTP-01). Off by default so
+--- local docker/dev on :8080 still works; enable on public edges with ACME.
+function _M.tls_required()
+    local flag = os.getenv("MENDR_TLS_REQUIRED")
+    return flag == "true" or flag == "1"
+end
+
+--- In-edge ACME (Let's Encrypt) via lua-resty-acme. Requires public DNS CNAME
+--- to this edge and ports 80/443.
+function _M.acme_enabled()
+    local flag = os.getenv("MENDR_ACME_ENABLED")
+    return flag == "true" or flag == "1"
+end
+
+function _M.acme_email()
+    return os.getenv("MENDR_ACME_EMAIL") or ""
+end
+
+--- Comma-separated domains this edge may issue certs for (hostname isolation).
+--- Returns list + set: domains.list = { "a.com", ... }, domains.set["a.com"] = true
+function _M.acme_domains()
+    local raw = os.getenv("MENDR_ACME_DOMAINS") or ""
+    local list, set = {}, {}
+    for part in string.gmatch(raw, "[^,]+") do
+        local d = string.lower((part:match("^%s*(.-)%s*$")) or "")
+        if d ~= "" and not set[d] then
+            set[d] = true
+            table.insert(list, d)
+        end
+    end
+    return { list = list, set = set }
+end
+
+function _M.acme_domain_allowed(host)
+    if not host or host == "" then return false end
+    host = string.lower(host)
+    local domains = _M.acme_domains()
+    return domains.set[host] == true
+end
+
+--- Undeclared-route edge mode when the radixtree is built but path/method miss.
+--- observe|shadow|learning → log SHADOW_ROUTE_ACCESSED then 404;
+--- strict|enforcing → hard 404 without shadow metric.
+function _M.ingress_undeclared_enforce()
+    local mode = os.getenv("MENDR_INGRESS_UNDECLARED_ENFORCE")
+    if mode == nil or mode == "" then
+        return "observe"
+    end
+    return string.lower(mode)
+end
+
 --- Rewrite localhost / 127.0.0.1 so OpenResty inside Docker can reach host-run services.
 function _M.rewrite_localhost(url)
     if url == nil or url == "" then
