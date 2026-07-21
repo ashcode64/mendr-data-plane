@@ -11,6 +11,23 @@ local config         = require("config")
 
 local BODYLESS = { GET = true, HEAD = true, DELETE = true, OPTIONS = true }
 
+local function stash_report(source, target, endpoint, method, headers, payload)
+    ngx.ctx.envelope = {
+        sourceService = source or "unknown",
+        targetService = target or "unknown",
+        endpoint      = endpoint or ngx.var.uri or "/",
+        method        = method or ngx.req.get_method() or "GET",
+        payload       = payload or {},
+        headers       = headers or ngx.req.get_headers() or {},
+    }
+    ngx.ctx.reportSource = ngx.ctx.envelope.sourceService
+    ngx.ctx.reportTarget = ngx.ctx.envelope.targetService
+    ngx.ctx.reportEndpoint = ngx.ctx.envelope.endpoint
+    if payload then
+        ngx.ctx.requestPayload = payload
+    end
+end
+
 local function is_json_ct(headers)
     local ct = headers and (headers["Content-Type"] or headers["content-type"]) or ""
     return type(ct) == "string" and ct:lower():find("application/json", 1, true) ~= nil
@@ -48,6 +65,7 @@ if config.tls_required() and not ngx.var.https and ngx.var.scheme ~= "https" the
     -- Allow ACME HTTP-01 challenges through on port 80/8080.
     local uri = ngx.var.uri or ""
     if not uri:find("^/%.well%-known/acme%-challenge/") then
+        stash_report(nil, nil, uri, ngx.req.get_method(), ngx.req.get_headers(), nil)
         return proxy_core.json_error(403, "TLS_REQUIRED",
             "HTTPS is required for Mendr ingress on this edge", false)
     end
@@ -58,6 +76,7 @@ local headers = ngx.req.get_headers()
 local source_service, tenant, ierr = identity.resolve(headers, { host = ngx.var.host })
 if not source_service then
     identity.set_www_authenticate()
+    stash_report(nil, nil, ngx.var.uri, ngx.req.get_method(), headers, nil)
     return proxy_core.json_error(401, "IDENTITY_UNRESOLVED", ierr or "unauthorized", false)
 end
 
@@ -94,12 +113,14 @@ if not target_service then
             ngx.req.set_header("Content-Length", #body)
             return
         end
+        stash_report(source_service, nil, uri, method, headers, nil)
         return proxy_core.json_error(503, "INGRESS_NOT_READY",
             "Ingress routing table not yet available", false)
     end
     if fallthrough == "SHADOW_ROUTE_ACCESSED" then
         ngx.ctx.shadowRouteAccessed = true
     end
+    stash_report(source_service, nil, uri, method, headers, nil)
     return proxy_core.json_error(404, "ROUTE_NOT_FOUND",
         "No route for " .. method .. " " .. uri, false)
 end
@@ -120,11 +141,13 @@ if not BODYLESS[upper] then
     local err
     raw_body, has_body, body_spilled, is_json, err = read_body_for_ingress(headers)
     if err then
+        stash_report(source_service, target_service, endpoint_template, method, headers, nil)
         return proxy_core.json_error(err.status, err.code, err.message, false)
     end
     if has_body and not body_spilled and raw_body and is_json then
         local decoded, derr = cjson.decode(raw_body)
         if not decoded then
+            stash_report(source_service, target_service, endpoint_template, method, headers, nil)
             return proxy_core.json_error(400, "BAD_REQUEST",
                 "Invalid JSON: " .. (derr or "unknown"), false)
         end
@@ -149,5 +172,7 @@ local ctx = {
     enforce        = enforce or "observe",
 }
 
+-- Enable log.lua failure / validate-response reporting (same contract as envelope path).
+stash_report(source_service, target_service, endpoint_template, method, headers, payload)
 ngx.header["X-Mendr-Data-Plane"] = "lua"
 proxy_core.run(ctx)

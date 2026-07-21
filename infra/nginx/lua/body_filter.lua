@@ -42,6 +42,11 @@ if not raw_body then
     ngx.log(ngx.WARN, "body_filter: response is not valid JSON, passing through: ", decode_err)
     if status >= 400 then
         ngx.ctx.upstreamErrorBody = { raw = full_body }
+        -- Still attempt problem+json detect if Content-Type claims it (may be truncated JSON)
+        local ct = (ngx.ctx.upstreamContentType or ""):lower()
+        if ct:find("application/problem+json", 1, true) then
+            ngx.log(ngx.WARN, "body_filter: problem+json declared but body not valid JSON")
+        end
     end
     ngx.arg[1] = full_body
     return
@@ -51,6 +56,14 @@ ngx.ctx.rawResponseBody = raw_body
 
 if status >= 400 then
     ngx.ctx.upstreamErrorBody = { raw = raw_body }
+    local pd_mod = require("problem_detail")
+    local ct = ngx.ctx.upstreamContentType or ""
+    -- Plan: parse only when Content-Type is application/problem+json
+    if type(raw_body) == "table" and pd_mod.is_problem_content_type(ct) then
+        local pd = pd_mod.from_body(raw_body, status)
+        ngx.ctx.upstreamProblemDetail = pd
+        pd_mod.promote_localization(pd, ngx.ctx)
+    end
     ngx.arg[1] = full_body
     return
 end

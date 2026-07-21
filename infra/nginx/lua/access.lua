@@ -4,6 +4,25 @@
 local cjson      = require("cjson.safe")
 local proxy_core = require("proxy_core")
 
+local function stash_report_envelope(partial)
+    -- Ensure log.lua can POST /failures for early native rejects.
+    -- Always capture real request headers (Origin / corr) even when body never decoded.
+    local headers = (partial and partial.headers)
+        or ngx.req.get_headers()
+        or {}
+    ngx.ctx.envelope = {
+        sourceService = (partial and partial.sourceService) or "unknown",
+        targetService = (partial and partial.targetService) or "unknown",
+        endpoint      = (partial and partial.endpoint) or ngx.var.uri or "/",
+        method        = (partial and partial.method) or ngx.req.get_method() or "POST",
+        payload       = (partial and partial.payload) or {},
+        headers       = headers,
+    }
+    if partial and partial.payload then
+        ngx.ctx.requestPayload = partial.payload
+    end
+end
+
 ngx.req.read_body()
 local body_data = ngx.req.get_body_data()
 if not body_data then
@@ -18,13 +37,18 @@ if not body_data then
     end
 end
 if not body_data then
+    stash_report_envelope(nil)
     return proxy_core.json_error(400, "BAD_REQUEST", "Empty request body", false)
 end
 
 local envelope, err = cjson.decode(body_data)
 if not envelope then
+    stash_report_envelope(nil)
     return proxy_core.json_error(400, "BAD_REQUEST", "Invalid JSON: " .. (err or "unknown"), false)
 end
+
+-- Stash before required-field checks so missing-field rejects still report.
+stash_report_envelope(envelope)
 
 local ctx = {
     source_service = envelope.sourceService,
@@ -44,7 +68,6 @@ if not ctx.source_service or not ctx.target_service or not ctx.endpoint then
         "Missing required fields: sourceService, targetService, endpoint", false)
 end
 
-ngx.ctx.envelope = envelope
 ngx.ctx.requestPayload = ctx.payload
 ngx.header["X-Mendr-Data-Plane"] = "lua"
 

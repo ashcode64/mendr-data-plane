@@ -6,6 +6,7 @@ local cjson  = require("cjson.safe")
 local http   = require("resty.http")
 local dedup  = require("dedup")
 local config = require("config")
+local pd_mod = require("problem_detail")
 
 local CONTROL_PLANE_BASE = config.control_plane_base()
 
@@ -52,18 +53,40 @@ local function extract_error_message(status, envelope)
     if upstream and type(upstream) == "table" then
         local raw = upstream.raw
         if type(raw) == "table" then
-            if raw.message then return tostring(raw.message) end
-            if raw.error then return tostring(raw.error) end
-            if raw.detail then return tostring(raw.detail) end
+            local preferred = pd_mod.prefer_detail_message(raw)
+            if preferred then
+                return preferred
+            end
         elseif type(raw) == "string" and raw ~= "" then
             return raw
         end
+    end
+
+    local pd = ngx.ctx.upstreamProblemDetail or ngx.ctx.mendrProblemDetail
+    if type(pd) == "table" and pd.detail and tostring(pd.detail) ~= "" then
+        return tostring(pd.detail)
     end
 
     return "HTTP " .. status .. " from " .. (envelope.targetService or "") .. (envelope.endpoint or "")
 end
 
 local function classify_failure(status, envelope)
+    if ngx.ctx.failureCategory then
+        return ngx.ctx.failureCategory
+    end
+    -- Mendr-native problem title / error code
+    local pd = ngx.ctx.mendrProblemDetail or ngx.ctx.upstreamProblemDetail
+    if type(pd) == "table" and pd.error then
+        local code = tostring(pd.error)
+        if code == "CORS_FAILURE" then return "CORS" end
+        if code == "ROUTING_FAILURE" or code == "SNAPSHOT_MISSING" then return "ROUTING" end
+        if code == "IDENTITY_UNRESOLVED" or code == "TLS_REQUIRED"
+            or code == "ROUTE_NOT_FOUND" or code == "INGRESS_NOT_READY"
+            or code == "BAD_REQUEST" or code == "UNDECLARED_SURFACE"
+            or code == "PAYLOAD_TOO_LARGE" then
+            return "MENDR_NATIVE"
+        end
+    end
     if status == 502 or status == 503 or status == 504 then
         return "ROUTING"
     end
@@ -107,13 +130,59 @@ local function validate_response(premature, data)
     end
 end
 
+local function build_problem_detail(status, envelope, category, source, target, ep)
+    local upstream = ngx.ctx.upstreamProblemDetail or ngx.ctx.mendrProblemDetail
+    local corr = ngx.ctx.correlationId
+        or (envelope.headers and (envelope.headers["X-Correlation-Id"]
+            or envelope.headers["x-correlation-id"]
+            or envelope.headers["X-Request-Id"]
+            or envelope.headers["x-request-id"]))
+    local req_id = ngx.ctx.requestId
+        or (envelope.headers and (envelope.headers["X-Request-Id"] or envelope.headers["x-request-id"]))
+        or corr
+    local detail_msg = extract_error_message(status, envelope)
+
+    return pd_mod.merge_a3(upstream, {
+        category = category,
+        status = status,
+        source = source,
+        target = target,
+        endpoint = ep,
+        correlation_id = corr,
+        request_id = req_id,
+        detail_fallback = detail_msg,
+        request_uri = ngx.var.request_uri,
+        template_id = ngx.ctx.templateId or ngx.ctx.template_id,
+        json_path = ngx.ctx.jsonPath or ngx.ctx.json_path,
+    }), corr, req_id
+end
+
+--- Best-effort envelope for early Mendr-native exits (identity/TLS/bad body).
+local function resolve_envelope()
+    if ngx.ctx.envelope then
+        return ngx.ctx.envelope
+    end
+    if not (ngx.ctx.mendrProblemDetail or ngx.ctx.upstreamProblemDetail) then
+        return nil
+    end
+    local headers = ngx.req.get_headers() or {}
+    return {
+        sourceService = ngx.ctx.reportSource or "unknown",
+        targetService = ngx.ctx.reportTarget or "unknown",
+        endpoint      = ngx.ctx.reportEndpoint or ngx.var.uri or "/",
+        method        = ngx.req.get_method() or "GET",
+        payload       = {},
+        headers       = headers,
+    }
+end
+
 -- ── Main ────────────────────────────────────────────────────────────────────
 
 if ngx.ctx.javaFallback then
     return
 end
 
-local envelope = ngx.ctx.envelope
+local envelope = resolve_envelope()
 if not envelope then
     return
 end
@@ -131,16 +200,19 @@ if status >= 400 then
     if dedup.should_process("fail", source, target, ep, 60) then
         local category = classify_failure(status, envelope)
 
-        -- If CORS failure was already set in access.lua
-        if ngx.ctx.failureCategory then
-            category = ngx.ctx.failureCategory
-        end
-
         local cors_blocked_at = ngx.ctx.corsBlockedAt
         if category == "CORS_UPSTREAM" then
             cors_blocked_at = "UPSTREAM"
         elseif category == "CORS" and cors_blocked_at == nil then
             cors_blocked_at = "EDGE"
+        end
+
+        local problem_detail, corr, req_id = build_problem_detail(status, envelope, category, source, target, ep)
+
+        -- Prefer problem detail text when richer than synthetic message
+        local err_msg = extract_error_message(status, envelope)
+        if problem_detail.detail and problem_detail.detail ~= "" then
+            err_msg = problem_detail.detail
         end
 
         local failure_data = {
@@ -151,7 +223,7 @@ if status >= 400 then
             errorCode          = status,
             errorType          = category .. "_FAILURE",
             failureCategory    = category,
-            errorMessage       = extract_error_message(status, envelope),
+            errorMessage       = err_msg,
             requestPayload     = ngx.ctx.requestPayload,
             attemptedUrl       = ngx.var.target_upstream,
             targetServiceUrl   = ngx.ctx.targetServiceUrl,
@@ -160,6 +232,10 @@ if status >= 400 then
             upstreamOriginSent = ngx.ctx.outboundOrigin,
             corsBlockedAt      = cors_blocked_at,
             responsePayload    = ngx.ctx.upstreamErrorBody,
+            correlationId      = corr,
+            requestId          = req_id,
+            responseHeaders    = ngx.ctx.upstreamResponseHeaders,
+            problemDetail      = problem_detail,
         }
 
         local ok, err = ngx.timer.at(0, report_failure, failure_data)
@@ -181,6 +257,32 @@ if status < 400 and ngx.ctx.hasResponseContract then
 
             -- Only send if we have bodies to validate
             if raw_resp or transformed_resp then
+                local corr = ngx.ctx.correlationId
+                    or (envelope.headers and (envelope.headers["X-Correlation-Id"]
+                        or envelope.headers["x-correlation-id"]))
+                local req_id = ngx.ctx.requestId
+                    or (envelope.headers and (envelope.headers["X-Request-Id"]
+                        or envelope.headers["x-request-id"]))
+                    or corr
+                -- When a ProblemDetail was captured, merge A3 Mendr extensions (same as failures).
+                local upstream_pd = ngx.ctx.upstreamProblemDetail or ngx.ctx.mendrProblemDetail
+                local problem_detail = nil
+                if type(upstream_pd) == "table" then
+                    problem_detail = pd_mod.merge_a3(upstream_pd, {
+                        category = "RESPONSE",
+                        status = status,
+                        source = source,
+                        target = target,
+                        endpoint = ep,
+                        correlation_id = corr,
+                        request_id = req_id,
+                        detail_fallback = upstream_pd.detail,
+                        request_uri = ngx.var.request_uri,
+                        template_id = ngx.ctx.templateId or ngx.ctx.template_id,
+                        json_path = ngx.ctx.jsonPath or ngx.ctx.json_path,
+                    })
+                end
+
                 local validate_data = {
                     sourceService       = source,
                     targetService       = target,
@@ -191,6 +293,10 @@ if status < 400 and ngx.ctx.hasResponseContract then
                     rawResponse         = raw_resp,
                     transformedResponse = transformed_resp,
                     requestHeaders      = envelope.headers,
+                    correlationId       = corr,
+                    requestId           = req_id,
+                    responseHeaders     = ngx.ctx.upstreamResponseHeaders,
+                    problemDetail       = problem_detail,
                 }
 
                 local ok, err = ngx.timer.at(0, validate_response, validate_data)

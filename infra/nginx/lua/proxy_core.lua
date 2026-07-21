@@ -152,15 +152,48 @@ local function delegate_to_java(ctx, reason)
 end
 
 function _M.json_error(status, error_type, message, healing)
-    ngx.status = status
-    ngx.header.content_type = "application/json"
-    ngx.header["X-Mendr-Data-Plane"] = "lua"
-    ngx.say(cjson.encode({
-        error = error_type,
+    -- RFC 9457 Problem Details for Mendr-native blocks (identity/TLS/route/CORS/etc.)
+    -- so clients always see application/problem+json whether upstream or Mendr rejects.
+    local pd_mod = require("problem_detail")
+    local corr = ngx.ctx.correlationId
+    if not corr or corr == "" then
+        local headers = ngx.req.get_headers()
+        corr = headers["X-Correlation-Id"] or headers["x-correlation-id"]
+            or headers["X-Request-Id"] or headers["x-request-id"]
+        if not corr or corr == "" then
+            corr = ngx.var.request_id or (tostring(ngx.now()) .. "-" .. tostring(math.random(100000, 999999)))
+        end
+        ngx.ctx.correlationId = corr
+    end
+    local req_id = ngx.ctx.requestId
+    if not req_id or req_id == "" then
+        local headers = ngx.req.get_headers()
+        req_id = headers["X-Request-Id"] or headers["x-request-id"] or corr
+        ngx.ctx.requestId = req_id
+    end
+
+    local env = ngx.ctx.envelope
+    local instance = (env and env.endpoint and env.endpoint ~= "" and env.endpoint)
+        or ngx.var.request_uri or ngx.var.uri
+
+    local problem = pd_mod.native_problem({
         status = status,
+        error_type = error_type,
         message = message,
-        selfHealingTriggered = healing == true,
-    }))
+        healing = healing,
+        instance = instance,
+        correlation_id = corr,
+        request_id = req_id,
+    })
+    ngx.ctx.mendrProblemDetail = problem
+    ngx.ctx.upstreamProblemDetail = problem
+
+    ngx.status = status
+    ngx.header.content_type = "application/problem+json"
+    ngx.header["X-Mendr-Data-Plane"] = "lua"
+    ngx.header["X-Correlation-Id"] = corr
+    ngx.header["X-Request-Id"] = req_id
+    ngx.say(cjson.encode(problem))
     return ngx.exit(status)
 end
 
@@ -282,6 +315,8 @@ local function check_strict_surface(route_config, ctx)
         if not surface.additionalQueryParams then
             for name, _ in pairs(args) do
                 if not allow_set[name] then
+                    -- "when known" diagnostics for A3 ProblemDetail extensions
+                    ngx.ctx.json_path = "query:" .. tostring(name)
                     return false, "Undeclared query parameter: " .. tostring(name)
                 end
             end
@@ -300,6 +335,7 @@ local function check_strict_surface(route_config, ctx)
         end
         for k, _ in pairs(payload) do
             if type(k) == "string" and not allow_body[k] then
+                ngx.ctx.json_path = "/" .. k
                 return false, "Undeclared request field: " .. k
             end
         end
@@ -493,6 +529,11 @@ function _M.run(ctx)
     ngx.req.set_header("X-Mendr-Data-Plane", "lua")
     ngx.req.set_header("X-Source-Service", source_service)
     ngx.req.set_header("X-Resolved-URL", target_base)
+    -- Path A1: opportunistically request RFC 9457 when client did not set Accept.
+    local existing_accept = headers and (headers["Accept"] or headers["accept"])
+    if not existing_accept or existing_accept == "" then
+        ngx.req.set_header("Accept", "application/problem+json, application/json;q=0.9, */*;q=0.1")
+    end
 
     apply_auth(route_config, headers)
 
