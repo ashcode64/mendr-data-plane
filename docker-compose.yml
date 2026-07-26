@@ -20,6 +20,11 @@ services:
       GATEWAY_INTERNAL_API_KEY: ${GATEWAY_INTERNAL_API_KEY:-}
       # Periodic full route-config resync backstop (seconds). 0 disables.
       MENDR_FULL_RESYNC_INTERVAL_SEC: ${MENDR_FULL_RESYNC_INTERVAL_SEC:-300}
+      # Sampled TRAFFIC_OBSERVED topology edge reporting (init_v14). OFF by default; when enabled,
+      # a sampled/deduped fraction of proxied calls POST the observed source->target edge (with
+      # propagated trace context) to /api/internal/edge-observations on the control plane.
+      MENDR_EDGE_OBSERVATION_ENABLED: ${MENDR_EDGE_OBSERVATION_ENABLED:-false}
+      MENDR_EDGE_OBSERVATION_SAMPLE_RATE: ${MENDR_EDGE_OBSERVATION_SAMPLE_RATE:-1.0}
       MENDR_INGRESS_ENABLED: ${MENDR_INGRESS_ENABLED:-false}
       MENDR_TLS_REQUIRED: ${MENDR_TLS_REQUIRED:-false}
       MENDR_ACME_ENABLED: ${MENDR_ACME_ENABLED:-false}

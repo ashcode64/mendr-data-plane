@@ -130,6 +130,28 @@ local function validate_response(premature, data)
     end
 end
 
+-- ── Timer callback: report a batch of observed topology edges ────────────────
+
+local function report_edge_observations(premature, data)
+    if premature then return end
+
+    local ok, err = pcall(post_json,
+        CONTROL_PLANE_BASE .. "/api/internal/edge-observations", data)
+    if not ok then
+        ngx.log(ngx.ERR, "log.lua: report_edge_observations error: ", err)
+    end
+end
+
+--- Propagated W3C/B3 trace context, preferred over Mendr's correlationId for
+--- cross-hop caller->callee attribution (never timing).
+local function resolve_traceparent(envelope)
+    if ngx.ctx.traceparent and ngx.ctx.traceparent ~= "" then
+        return ngx.ctx.traceparent
+    end
+    local h = (envelope and envelope.headers) or ngx.req.get_headers() or {}
+    return h["traceparent"] or h["Traceparent"]
+end
+
 local function build_problem_detail(status, envelope, category, source, target, ep)
     local upstream = ngx.ctx.upstreamProblemDetail or ngx.ctx.mendrProblemDetail
     local corr = ngx.ctx.correlationId
@@ -234,6 +256,7 @@ if status >= 400 then
             responsePayload    = ngx.ctx.upstreamErrorBody,
             correlationId      = corr,
             requestId          = req_id,
+            traceparent        = resolve_traceparent(envelope),
             responseHeaders    = ngx.ctx.upstreamResponseHeaders,
             problemDetail      = problem_detail,
         }
@@ -303,6 +326,43 @@ if status < 400 and ngx.ctx.hasResponseContract then
                 if not ok then
                     ngx.log(ngx.ERR, "log.lua: failed to schedule validate timer: ", err)
                 end
+            end
+        end
+    end
+end
+
+-- ── 3. Sampled edge observation (TRAFFIC_OBSERVED topology tier) ─────────────
+-- An edge exists whether or not this call failed, so this runs on any proxied
+-- call with a resolved source+target. Attribution is Mendr's own routing envelope
+-- (source->target) — reliable, not timing-based — while trace context rides along
+-- for downstream causal correlation. Sampling + a per-edge dedup window cap volume;
+-- the endpoint accepts a batch so this can later flush from a shared dict.
+
+if config.edge_observation_enabled() and source ~= "" and target ~= "" then
+    local sample_rate = config.edge_observation_sample_rate()
+    if math.random() < sample_rate then
+        -- Dedup window caps to at most one observation per edge per 5 min.
+        if dedup.should_process("edgeobs", source, target, ep, 300) then
+            local corr = ngx.ctx.correlationId
+                or (envelope.headers and (envelope.headers["X-Correlation-Id"]
+                    or envelope.headers["x-correlation-id"]
+                    or envelope.headers["X-Request-Id"]
+                    or envelope.headers["x-request-id"]))
+            local observation = {
+                sourceService = source,
+                targetService = target,
+                endpoint      = ep,
+                httpMethod    = method,
+                statusCode    = status,
+                correlationId = corr,
+                requestId     = ngx.ctx.requestId or corr,
+                traceparent   = resolve_traceparent(envelope),
+                observedAt    = ngx.utctime(),
+            }
+            -- Batch-shaped payload (list of one today; shared-dict batching can slot in here).
+            local ok, err = ngx.timer.at(0, report_edge_observations, { observations = { observation } })
+            if not ok then
+                ngx.log(ngx.ERR, "log.lua: failed to schedule edge-observation timer: ", err)
             end
         end
     end

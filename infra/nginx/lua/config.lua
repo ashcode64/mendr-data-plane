@@ -70,6 +70,28 @@ function _M.full_resync_interval_sec()
     return n
 end
 
+--- Sampled edge-observation reporting (TRAFFIC_OBSERVED topology tier). Off by default —
+--- when enabled, a sampled/deduped fraction of proxied calls report the observed
+--- source->target:endpoint edge (with propagated trace context) to the control plane.
+function _M.edge_observation_enabled()
+    local flag = os.getenv("MENDR_EDGE_OBSERVATION_ENABLED")
+    return flag == "true" or flag == "1"
+end
+
+--- Fraction [0,1] of proxied calls that emit an edge observation (after the per-edge
+--- dedup window already caps volume). Defaults to 1.0 when unset/invalid.
+function _M.edge_observation_sample_rate()
+    local raw = os.getenv("MENDR_EDGE_OBSERVATION_SAMPLE_RATE")
+    local n = tonumber(raw)
+    if n == nil or n < 0 then
+        return 1.0
+    end
+    if n > 1 then
+        return 1.0
+    end
+    return n
+end
+
 --- Transparent HTTP ingress (OpenAPI base-URL swap). Off by default.
 function _M.ingress_enabled()
     local flag = os.getenv("MENDR_INGRESS_ENABLED")

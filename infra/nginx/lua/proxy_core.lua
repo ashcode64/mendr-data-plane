@@ -10,9 +10,15 @@ local transform = require("transform")
 local _M = {}
 
 -- Headers the edge may forward from the client (envelope.headers or real HTTP).
+-- W3C trace-context (traceparent/tracestate) and B3 headers are propagated so a
+-- caller->callee edge can be attributed by trace context across hops (init_v14
+-- topology observation) — never by timing proximity.
 local PASSTHROUGH_HEADERS = {
     authorization = true, ["x-api-key"] = true, ["x-correlation-id"] = true,
     ["x-request-id"] = true, ["x-trace-id"] = true, origin = true,
+    traceparent = true, tracestate = true,
+    ["x-b3-traceid"] = true, ["x-b3-spanid"] = true, ["x-b3-parentspanid"] = true,
+    ["x-b3-sampled"] = true, ["x-b3-flags"] = true, b3 = true,
 }
 
 -- Never forward these to upstream (edge credentials / identity spoof surface).
