@@ -175,32 +175,59 @@ local function split_pointer(pointer)
     return tokens
 end
 
--- Read the value at a pointer, or nil if any segment is missing / not an object.
+-- A JSON Pointer numeric token addresses an array element (0-based) when the
+-- node is a JSON array. cjson decodes arrays as 1-based integer-keyed sequences
+-- and objects as string-keyed tables, so a genuine array has node[1] ~= nil and
+-- no matching string key. This mirrors JsonPointers.java (Map vs List dispatch)
+-- so the edge and the control-plane oracle resolve /items/0/... identically.
+local function arr_idx(node, tok)
+    if type(node) == "table" and node[1] ~= nil and node[tok] == nil
+        and tok:match("^%d+$") then
+        return tonumber(tok) + 1
+    end
+    return nil
+end
+
+-- Read the value at a pointer, or nil if any segment is missing.
 function _M.get_path(payload, pointer)
     local tokens = split_pointer(pointer)
     if not tokens then return nil end
     local node = payload
     for i = 1, #tokens do
         if type(node) ~= "table" then return nil end
-        node = node[tokens[i]]
+        local ai = arr_idx(node, tokens[i])
+        node = ai and node[ai] or node[tokens[i]]
         if node == nil then return nil end
     end
     return node
 end
 
--- Set value at a pointer, creating intermediate objects as needed.
+-- Set value at a pointer, creating intermediate objects as needed. Array
+-- indices are navigated, never grown (matches JsonPointers.set).
 function _M.set_path(payload, pointer, value)
     local tokens = split_pointer(pointer)
     if not tokens then return false end
     local node = payload
     for i = 1, #tokens - 1 do
         local key = tokens[i]
-        if type(node[key]) ~= "table" then
-            node[key] = {}
+        local ai = arr_idx(node, key)
+        if ai then
+            if node[ai] == nil then return false end
+            node = node[ai]
+        else
+            if type(node[key]) ~= "table" then
+                node[key] = {}
+            end
+            node = node[key]
         end
-        node = node[key]
     end
-    node[tokens[#tokens]] = value
+    local last = tokens[#tokens]
+    local ai = arr_idx(node, last)
+    if ai then
+        if node[ai] ~= nil then node[ai] = value end
+    else
+        node[last] = value
+    end
     return true
 end
 
@@ -213,15 +240,23 @@ function _M.delete_path(payload, pointer)
     local node = payload
     for i = 1, #tokens - 1 do
         if type(node) ~= "table" then return false end
-        node = node[tokens[i]]
+        local ai = arr_idx(node, tokens[i])
+        node = ai and node[ai] or node[tokens[i]]
         if node == nil then return false end
         chain[#chain + 1] = node
     end
     if type(node) ~= "table" then return false end
-    node[tokens[#tokens]] = nil
-    -- Prune empty parents from the deepest upward (skip the root payload itself).
+    local last = tokens[#tokens]
+    local ai = arr_idx(node, last)
+    if ai then
+        table.remove(node, ai)
+    else
+        node[last] = nil
+    end
+    -- Prune empty parents from the deepest upward (skip the root payload itself),
+    -- but only through object parents; array elements are addressed by position.
     for i = #chain, 2, -1 do
-        if next(chain[i]) == nil then
+        if next(chain[i]) == nil and arr_idx(chain[i - 1], tokens[i - 1]) == nil then
             chain[i - 1][tokens[i - 1]] = nil
         else
             break
@@ -421,6 +456,76 @@ local function deep_copy(v)
     return out
 end
 
+_M.deep_copy = deep_copy
+
+-- Undo log for apply_ops: mutate in place and roll back on fault instead of
+-- deep-copying the whole document. Spill back to deep_copy when the write
+-- count exceeds UNDO_CAP (e.g. strip_unknown deleting many keys).
+local UNDO_CAP = 64
+local undo_ctx = nil
+
+-- Returns false when the mutation must not proceed (spill). Callers MUST NOT
+-- mutate if this returns false; restore + deep_copy retry will re-run.
+local function undo_try(entry)
+    if not undo_ctx then return true end
+    if undo_ctx.spilled then return false end
+    if #undo_ctx.entries >= UNDO_CAP then
+        undo_ctx.spilled = true
+        return false
+    end
+    undo_ctx.entries[#undo_ctx.entries + 1] = entry
+    return true
+end
+
+local function set_mut(payload, pointer, value)
+    if undo_ctx then
+        local old = _M.get_path(payload, pointer)
+        if not undo_try({ kind = "set", pointer = pointer, old = old, existed = old ~= nil }) then
+            return
+        end
+    end
+    _M.set_path(payload, pointer, value)
+end
+
+local function del_mut(payload, pointer)
+    if undo_ctx then
+        local old = _M.get_path(payload, pointer)
+        if not undo_try({ kind = "set", pointer = pointer, old = old, existed = old ~= nil }) then
+            return
+        end
+    end
+    _M.delete_path(payload, pointer)
+end
+
+local function restore_undo(current, entries)
+    local cur = current
+    for i = #entries, 1, -1 do
+        local e = entries[i]
+        if e.kind == "root" then
+            cur = e.old
+        elseif e.kind == "set" then
+            if e.existed then
+                _M.set_path(cur, e.pointer, e.old)
+            else
+                _M.delete_path(cur, e.pointer)
+            end
+        elseif e.kind == "strip" then
+            local node
+            if e.pointer == nil or e.pointer == "" or e.pointer == "/" then
+                node = cur
+            else
+                node = _M.get_path(cur, e.pointer)
+            end
+            if type(node) == "table" and type(e.deleted) == "table" then
+                for k, v in pairs(e.deleted) do
+                    node[k] = v
+                end
+            end
+        end
+    end
+    return cur
+end
+
 local function as_str(v)
     if v == nil or v == JSON_NULL then return "" end
     if type(v) == "boolean" then return v and "true" or "false" end
@@ -581,30 +686,38 @@ local function apply_op(payload, op)
     if kind == "rename" or kind == "move" then
         local v = _M.get_path(payload, op.from)
         if v ~= nil then
-            _M.set_path(payload, op.to, v)
-            if op.from ~= op.to then _M.delete_path(payload, op.from) end
+            set_mut(payload, op.to, v)
+            if op.from ~= op.to then del_mut(payload, op.from) end
         end
         return payload
     elseif kind == "copy" then
         local v = _M.get_path(payload, op.from)
-        if v ~= nil then _M.set_path(payload, op.to, v) end
+        if v ~= nil then set_mut(payload, op.to, v) end
         return payload
     elseif kind == "remove" then
-        _M.delete_path(payload, op.path)
+        del_mut(payload, op.path)
         return payload
     elseif kind == "wrap" then
+        if not undo_try({ kind = "root", old = payload }) then
+            return payload
+        end
         return { [op.key] = payload }
     elseif kind == "unwrap" then
-        if type(payload) == "table" and payload[op.key] ~= nil then return payload[op.key] end
+        if type(payload) == "table" and payload[op.key] ~= nil then
+            if not undo_try({ kind = "root", old = payload }) then
+                return payload
+            end
+            return payload[op.key]
+        end
         return payload
     elseif kind == "wrap_array" then
         local v = _M.get_path(payload, op.path)
-        if v ~= nil then _M.set_path(payload, op.path, { v }) end
+        if v ~= nil then set_mut(payload, op.path, { v }) end
         return payload
     elseif kind == "unwrap_array" then
         local v = _M.get_path(payload, op.path)
         if type(v) == "table" and v[1] ~= nil and #v == 1 then
-            _M.set_path(payload, op.path, v[1])
+            set_mut(payload, op.path, v[1])
         end
         return payload
     elseif kind == "strip_unknown" then
@@ -613,8 +726,27 @@ local function apply_op(payload, op)
         if type(node) == "table" and type(op.allowed) == "table" then
             local allow = {}
             for _, k in ipairs(op.allowed) do allow[k] = true end
-            for k in pairs(node) do
-                if type(k) == "string" and not allow[k] then node[k] = nil end
+            local deleted = {}
+            local n = 0
+            for k, val in pairs(node) do
+                if type(k) == "string" and not allow[k] then
+                    n = n + 1
+                    deleted[k] = val
+                end
+            end
+            if n > 0 then
+                if undo_ctx then
+                    if #undo_ctx.entries + 1 > UNDO_CAP then
+                        undo_ctx.spilled = true
+                        return payload
+                    end
+                    if not undo_try({ kind = "strip", pointer = p, deleted = deleted }) then
+                        return payload
+                    end
+                end
+                for k in pairs(deleted) do
+                    node[k] = nil
+                end
             end
         end
         return payload
@@ -627,17 +759,17 @@ local function apply_op(payload, op)
         local fire = (on == "ABSENT" and not exists)
             or (on == "NULL" and is_null)
             or (on == "BOTH" and (not exists or is_null))
-        if fire then _M.set_path(payload, op.path, op.value) end
+        if fire then set_mut(payload, op.path, op.value) end
         return payload
     elseif kind == "coalesce" then
         if _M.get_path(payload, op.path) == JSON_NULL then
-            _M.set_path(payload, op.path, op.value)
+            set_mut(payload, op.path, op.value)
         end
         return payload
     elseif kind == "coerce" then
         local v = _M.get_path(payload, op.path)
         if v == nil then return payload end
-        _M.set_path(payload, op.path, coerce_strict((v == JSON_NULL) and nil or v, op.targetType))
+        set_mut(payload, op.path, coerce_strict((v == JSON_NULL) and nil or v, op.targetType))
         return payload
     elseif kind == "scale" then
         local v = _M.get_path(payload, op.path)
@@ -648,7 +780,7 @@ local function apply_op(payload, op)
         if den == nil or den == 0 then error("scale: denominator zero") end
         local res = n * (tonumber(op.numerator) or 0) / den
         assert_bounds(res, op.expectedMin, op.expectedMax)
-        _M.set_path(payload, op.path, norm_num(res))
+        set_mut(payload, op.path, norm_num(res))
         return payload
     elseif kind == "arith" then
         local v = _M.get_path(payload, op.path)
@@ -666,14 +798,14 @@ local function apply_op(payload, op)
             res = n / operand
         else error("arith: bad operator") end
         assert_bounds(res, op.expectedMin, op.expectedMax)
-        _M.set_path(payload, op.path, norm_num(res))
+        set_mut(payload, op.path, norm_num(res))
         return payload
     elseif kind == "map_value" then
         local v = _M.get_path(payload, op.path)
         if v == nil then return payload end
         local key = as_str((v == JSON_NULL) and nil or v)
         if type(op.mapping) == "table" and op.mapping[key] ~= nil then
-            _M.set_path(payload, op.path, op.mapping[key])
+            set_mut(payload, op.path, op.mapping[key])
             return payload
         end
         if (op.onUnmapped or "reject") == "passthrough" then return payload end
@@ -690,7 +822,7 @@ local function apply_op(payload, op)
         if secs < 0 or secs > DATE_EPOCH_MAX then error("reformat_date: out of validity window") end
         local out = epoch_ms_to_date(ms, op.targetFormat)
         if out == nil then error("reformat_date: format failure") end
-        _M.set_path(payload, op.path, out)
+        set_mut(payload, op.path, out)
         return payload
     elseif kind == "string" then
         local v = _M.get_path(payload, op.path)
@@ -705,7 +837,7 @@ local function apply_op(payload, op)
         elseif oper == "append" then out = s .. as_str(args[1] or "")
         elseif oper == "replace" then out = literal_replace(s, as_str(args[1] or ""), as_str(args[2] or ""))
         else error("string: bad operation") end
-        _M.set_path(payload, op.path, out)
+        set_mut(payload, op.path, out)
         return payload
     elseif kind == "conditional" then
         local branch = eval_predicate(op.predicate or {}, payload)
@@ -722,21 +854,49 @@ local function apply_op(payload, op)
     error("unknown opcode: " .. tostring(kind))
 end
 
--- Run a closed-opcode program over a fresh copy of `payload`. Any op fault makes
--- the WHOLE program fail closed: the original payload is returned unmodified.
+-- Run a closed-opcode program. Mutates in place with an undo log so a fault
+-- rolls back instead of deep-copying the whole document. Spills to deep_copy
+-- when writes exceed UNDO_CAP (strip_unknown, large programs).
 function _M.apply_ops(payload, ops)
-    if type(ops) ~= "table" or #ops == 0 then return payload end
-    local work = deep_copy(payload)
-    local ok, result = pcall(function()
-        local cur = work
+    if type(ops) ~= "table" or #ops == 0 then return payload, true end
+
+    local function run(root)
+        local cur = root
+        if undo_ctx then undo_ctx.current = cur end
         for _, op in ipairs(ops) do
-            if type(op) == "table" then cur = apply_op(cur, op) end
+            if type(op) == "table" then
+                cur = apply_op(cur, op)
+                if undo_ctx then
+                    undo_ctx.current = cur
+                    if undo_ctx.spilled then
+                        error("undo_spill")
+                    end
+                end
+            end
         end
         return cur
-    end)
-    if ok then return result end
+    end
+
+    undo_ctx = { entries = {}, spilled = false, current = payload }
+    local ok, result = pcall(run, payload)
+    local spilled = undo_ctx.spilled or (not ok and tostring(result) == "undo_spill")
+    local entries = undo_ctx.entries
+    local current = undo_ctx.current or payload
+    undo_ctx = nil
+
+    if spilled then
+        local restored = restore_undo(current, entries)
+        local work = deep_copy(restored)
+        local ok2, result2 = pcall(run, work)
+        if ok2 then return result2, true end
+        log_transform_err("transform: MendrScript program failed closed: " .. tostring(result2))
+        return restored, false
+    end
+
+    if ok then return result, true end
+    restore_undo(current, entries)
     log_transform_err("transform: MendrScript program failed closed: " .. tostring(result))
-    return payload
+    return payload, false
 end
 
 function _M.apply_program(payload, program)

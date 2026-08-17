@@ -19,7 +19,7 @@ local FULL_RESYNC_KEY   = "last_full_resync_at"
 -- "v2" = MendrScript closed-opcode interpreter; "ingress" = transparent HTTP
 -- ingress + radixtree routing tables. Control plane withholds features the edge
 -- does not advertise.
-local EDGE_CAPS = "v2,ingress"
+local EDGE_CAPS = "v2,ingress,traffic,ratelimit,authz,cache,metrics,ai,waf,splice"
 
 local function redis_connect()
     local red = redis:new()
@@ -109,6 +109,16 @@ local function apply_sync_payload(payload)
         end
     end
 
+    -- AI gateway routes (virtual_path → policy JSON)
+    local ai_routes = payload.aiRoutes
+    if type(ai_routes) == "table" then
+        for key, value in pairs(ai_routes) do
+            if type(key) == "string" and type(value) == "string" then
+                red:set(key, value)
+            end
+        end
+    end
+
     redis_close(red)
 
     -- Rebuild radixtrees from the just-written tables + route keys
@@ -133,6 +143,11 @@ local function apply_sync_payload(payload)
     end
 
     sync_dict:set("last_version", tostring(version))
+    -- Invalidate response/semantic cache on route sync so stale HIT bodies cannot linger
+    local ok_rc, response_cache = pcall(require, "response_cache")
+    if ok_rc and response_cache and response_cache.invalidate_all then
+        pcall(response_cache.invalidate_all)
+    end
     ngx.log(ngx.INFO, "sync_client: applied routeconfig sync version ", version)
     return true
 end

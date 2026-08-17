@@ -176,4 +176,18 @@ function _M.rewrite_localhost(url)
     return url
 end
 
+function _M.waf_mode()
+    return string.lower(os.getenv("MENDR_WAF_MODE") or "detect")
+end
+
+function _M.otel_enabled()
+    local flag = os.getenv("MENDR_OTEL_ENABLED")
+    return flag == "true" or flag == "1"
+end
+
+function _M.mtls_enabled()
+    local flag = os.getenv("MENDR_MTLS_ENABLED")
+    return flag == "true" or flag == "1"
+end
+
 return _M

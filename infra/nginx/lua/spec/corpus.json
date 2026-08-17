@@ -1,0 +1,210 @@
+[
+  {
+    "name": "rename",
+    "body": "{\"amt\":10,\"keep\":true}",
+    "ops": [{"op": "rename", "from": "/amt", "to": "/amount"}],
+    "expected": {"amount": 10, "keep": true}
+  },
+  {
+    "name": "rename-then-coerce",
+    "body": "{\"amt\":\"5\"}",
+    "ops": [
+      {"op": "rename", "from": "/amt", "to": "/amount"},
+      {"op": "coerce", "path": "/amount", "targetType": "integer"}
+    ],
+    "expected": {"amount": 5}
+  },
+  {
+    "name": "wrap",
+    "body": "{\"n\":1}",
+    "ops": [{"op": "wrap", "key": "data"}],
+    "expected": {"data": {"n": 1}}
+  },
+  {
+    "name": "unwrap",
+    "body": "{\"data\":{\"id\":1}}",
+    "ops": [{"op": "unwrap", "key": "data"}],
+    "expected": {"id": 1}
+  },
+  {
+    "name": "scale-ok",
+    "body": "{\"amount\":2500}",
+    "ops": [{
+      "op": "scale", "path": "/amount", "numerator": 1, "denominator": 100,
+      "expectedMin": 0, "expectedMax": 1000000
+    }],
+    "expected": {"amount": 25}
+  },
+  {
+    "name": "scale-fail",
+    "body": "{\"amount\":50}",
+    "ops": [{
+      "op": "scale", "path": "/amount", "numerator": 1000, "denominator": 1,
+      "expectedMin": 0, "expectedMax": 100
+    }],
+    "failClosed": true
+  },
+  {
+    "name": "same-parent-move",
+    "body": "{\"user\":{\"amt\":1,\"keep\":true}}",
+    "ops": [{"op": "move", "from": "/user/amt", "to": "/user/amount"}],
+    "expected": {"user": {"amount": 1, "keep": true}}
+  },
+  {
+    "name": "remove",
+    "body": "{\"keep\":1,\"drop\":2}",
+    "ops": [{"op": "remove", "path": "/drop"}],
+    "expected": {"keep": 1}
+  },
+  {
+    "name": "key-order",
+    "body": "{\"b\":2,\"a\":1}",
+    "ops": [{"op": "rename", "from": "/a", "to": "/alpha"}],
+    "expected": {"b": 2, "alpha": 1}
+  },
+  {
+    "name": "escaped-key",
+    "body": "{\"user\\u005fname\":1}",
+    "ops": [{"op": "rename", "from": "/user_name", "to": "/uname"}],
+    "expected": {"uname": 1}
+  },
+  {
+    "name": "duplicate-key",
+    "body": "{\"amt\":1,\"amt\":2}",
+    "ops": [{"op": "rename", "from": "/amt", "to": "/amount"}],
+    "expected": {"amount": 2}
+  },
+  {
+    "name": "int64-untouched",
+    "body": "{\"id\":9007199254740993,\"amt\":1}",
+    "ops": [{"op": "rename", "from": "/amt", "to": "/amount"}],
+    "expected": {"id": 9007199254740993, "amount": 1}
+  },
+  {
+    "name": "deep-nested",
+    "body": "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":\"jo\"}}}}}",
+    "ops": [{"op": "string", "path": "/a/b/c/d/e", "operation": "upper"}],
+    "expected": {"a": {"b": {"c": {"d": {"e": "JO"}}}}}
+  },
+  {
+    "name": "array-nested-rename",
+    "body": "{\"items\":[{\"amt\":1,\"keep\":true}]}",
+    "ops": [{"op": "rename", "from": "/items/0/amt", "to": "/items/0/amount"}],
+    "expected": {"items": [{"amount": 1, "keep": true}]}
+  },
+  {
+    "name": "chunk-boundary-rename",
+    "body": "{\"amt\":10,\"keep\":true}",
+    "ops": [{"op": "rename", "from": "/amt", "to": "/amount"}],
+    "expected": {"amount": 10, "keep": true},
+    "luaOnly": true,
+    "perByte": true
+  },
+  {
+    "name": "chunk-boundary-number",
+    "body": "{\"n\":123,\"keep\":true}",
+    "ops": [{"op": "rename", "from": "/keep", "to": "/kept"}],
+    "expected": {"n": 123, "kept": true},
+    "luaOnly": true,
+    "perByte": true
+  },
+  {
+    "name": "nested-pointer-on-scalar",
+    "body": "{\"user\":123}",
+    "ops": [{"op": "rename", "from": "/user/amt", "to": "/user/amount"}],
+    "expected": {"user": 123},
+    "luaOnly": true,
+    "perByte": true
+  },
+  {
+    "name": "window-move-keys-before-from",
+    "body": "{\"keep\":true,\"amt\":1}",
+    "ops": [{"op": "move", "from": "/amt", "to": "/amount"}],
+    "expected": {"keep": true, "amount": 1},
+    "perByte": true
+  },
+  {
+    "name": "remove-first-key",
+    "body": "{\"drop\":1,\"keep\":2}",
+    "ops": [{"op": "remove", "path": "/drop"}],
+    "expected": {"keep": 2},
+    "perByte": true
+  },
+  {
+    "name": "array-index-remove",
+    "body": "{\"items\":[1,2,3]}",
+    "ops": [{"op": "remove", "path": "/items/0"}],
+    "expected": {"items": [2, 3]},
+    "perByte": true
+  },
+  {
+    "name": "array-index-remove-middle",
+    "body": "{\"items\":[1,2,3]}",
+    "ops": [{"op": "remove", "path": "/items/1"}],
+    "expected": {"items": [1, 3]},
+    "perByte": true
+  },
+  {
+    "name": "default-null",
+    "body": "{\"active\":null,\"keep\":1}",
+    "ops": [{"op": "default", "path": "/active", "value": true, "on": "NULL"}],
+    "expected": {"active": true, "keep": 1},
+    "perByte": true
+  },
+  {
+    "name": "default-null-leaves-non-null",
+    "body": "{\"active\":false}",
+    "ops": [{"op": "default", "path": "/active", "value": true, "on": "NULL"}],
+    "expected": {"active": false}
+  },
+  {
+    "name": "array-index-move",
+    "body": "{\"items\":[1,2,3]}",
+    "ops": [{"op": "move", "from": "/items/0", "to": "/items/2"}],
+    "expected": {"items": [2, 1]},
+    "perByte": true
+  },
+  {
+    "name": "array-index-copy",
+    "body": "{\"items\":[1,2,3]}",
+    "ops": [{"op": "copy", "from": "/items/0", "to": "/items/2"}],
+    "expected": {"items": [1, 2, 1]}
+  },
+  {
+    "name": "array-multi-remove",
+    "body": "{\"items\":[1,2,3]}",
+    "ops": [
+      {"op": "remove", "path": "/items/0"},
+      {"op": "remove", "path": "/items/1"}
+    ],
+    "expected": {"items": [2]},
+    "perByte": true
+  },
+  {
+    "name": "array-remove-then-coerce-shifted",
+    "body": "{\"items\":[1,2,3]}",
+    "ops": [
+      {"op": "remove", "path": "/items/0"},
+      {"op": "coerce", "path": "/items/0", "targetType": "string"}
+    ],
+    "expected": {"items": ["2", 3]},
+    "perByte": true
+  },
+  {
+    "name": "array-remove-then-scale-shifted",
+    "body": "{\"items\":[10,20,30]}",
+    "ops": [
+      {"op": "remove", "path": "/items/0"},
+      {"op": "scale", "path": "/items/0", "numerator": 10, "denominator": 1}
+    ],
+    "expected": {"items": [200, 30]},
+    "perByte": true
+  },
+  {
+    "name": "array-copy-span-suffix",
+    "body": "{\"a\":[1,2,3,4,5,6]}",
+    "ops": [{"op": "copy", "from": "/a/4", "to": "/a/5"}],
+    "expected": {"a": [1, 2, 3, 4, 5, 5]},
+    "perByte": true
+  }
+]

@@ -163,6 +163,9 @@ local function resolve_by_key(key)
             if not _M.constant_time_equals(presented_hash, cached.key_hash) then
                 return nil, nil, "secret mismatch"
             end
+            if type(cached.scopes) == "table" then
+                ngx.ctx.api_key_scopes = cached.scopes
+            end
             return finish(cached.source, cached.tenant)
         end
         if neg_cache and neg_cache:get(prefix) then
@@ -220,6 +223,7 @@ local function resolve_by_key(key)
             key_hash = record.keyHash,
             source   = record.sourceService,
             tenant   = record.tenantId or record.tenant,
+            scopes   = record.scopes,
         }, HIT_TTL_SEC)
     end
 
@@ -227,7 +231,19 @@ local function resolve_by_key(key)
         return nil, nil, "secret mismatch"
     end
 
+    if type(record.scopes) == "table" then
+        ngx.ctx.api_key_scopes = record.scopes
+    elseif type(record.scopes) == "string" then
+        local decoded = cjson.decode(record.scopes)
+        ngx.ctx.api_key_scopes = type(decoded) == "table" and decoded or {}
+    end
+
     return finish(record.sourceService, (record.tenantId or record.tenant))
+end
+
+--- Public: verify presented API key (prefix.secret) against synced Redis projection.
+function _M.resolve_by_api_key(presented)
+    return resolve_by_key(presented)
 end
 
 --- Host → {sourceService, tenantId} from synced mendr:hostident:{host}.

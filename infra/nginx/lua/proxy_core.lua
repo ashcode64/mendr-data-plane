@@ -6,6 +6,15 @@ local cjson     = require("cjson.safe")
 local redis     = require("resty.redis")
 local config    = require("config")
 local transform = require("transform")
+local peer_resolver = require("peer_resolver")
+local rate_limit = require("rate_limit")
+local auth_jwt = require("auth_jwt")
+local response_cache = require("response_cache")
+local metrics = require("metrics")
+local circuit = require("circuit_breaker")
+local waf = require("waf")
+local otel = require("otel")
+local ai_gateway = require("ai_gateway")
 
 local _M = {}
 
@@ -407,6 +416,97 @@ function _M.run(ctx)
     ngx.ctx.hasResponseContract = route_config.hasResponseContract or false
     ngx.ctx.syncValidation = route_config.syncValidation or false
     ngx.ctx.registeredBaseUrl = route_config.registeredBaseUrl
+    ngx.ctx.request_start_ms = ngx.now() * 1000
+
+    -- API version negotiation (Accept-Version / X-API-Version vs snapshot.versioning)
+    local ver = route_config.versioning
+    if type(ver) == "table" and ver.apiVersion then
+        local hdr_name = ver.acceptVersionHeader or "Accept-Version"
+        local requested = headers[hdr_name] or headers[string.lower(hdr_name)]
+            or headers["X-API-Version"] or headers["x-api-version"]
+        if requested and tostring(requested) ~= ""
+                and tostring(requested) ~= tostring(ver.apiVersion) then
+            metrics.inc("mendr_edge_requests_total", { status = "406", reason = "version" }, 1)
+            return _M.json_error(406, "API_VERSION_MISMATCH",
+                "Requested version '" .. tostring(requested) .. "' does not match route version '"
+                    .. tostring(ver.apiVersion) .. "'"
+                    .. (ver.successorEndpoint and ("; try " .. tostring(ver.successorEndpoint)) or ""),
+                false)
+        end
+        -- Hard-close deprecated routes past sunset (RFC 8594 Sunset header date)
+        if (ver.deprecated == true or tostring(ver.deprecated) == "true")
+                and ver.sunsetAt and tostring(ver.sunsetAt) ~= "" then
+            -- Best-effort: if sunset parses as epoch or ISO date before now, return 410
+            local sunset = tostring(ver.sunsetAt)
+            local ok_p, parsed = pcall(function()
+                -- ngx.parse_http_time for IMF-fix dates
+                return ngx.parse_http_time(sunset)
+            end)
+            if ok_p and parsed and parsed > 0 and parsed < ngx.time() then
+                metrics.inc("mendr_edge_requests_total", { status = "410", reason = "sunset" }, 1)
+                return _M.json_error(410, "API_SUNSET",
+                    "API version " .. tostring(ver.apiVersion) .. " was sunset at " .. sunset
+                        .. (ver.successorEndpoint and ("; use " .. tostring(ver.successorEndpoint)) or ""),
+                    false)
+            end
+        end
+    end
+
+    otel.start_span(route_config)
+
+    -- WAF / geo / IP / payload caps (before auth to stop obvious attacks early)
+    local ok_waf, waf_err = waf.inspect(route_config, ctx)
+    if not ok_waf then
+        metrics.inc("mendr_edge_requests_total", { status = "403", reason = "waf" }, 1)
+        return _M.json_error(403, "WAF_BLOCKED", waf_err or "Blocked by WAF", false)
+    end
+
+    -- Edge consumer auth (capability authz) — cryptographic JWKS when configured
+    local ok_auth, auth_err = auth_jwt.enforce(route_config)
+    if not ok_auth then
+        metrics.inc("mendr_edge_requests_total", { status = "401", reason = "auth" }, 1)
+        return _M.json_error(401, "AUTH_FAILURE", auth_err or "Unauthorized", false)
+    end
+
+    -- Control-plane rate limit policy (capability ratelimit)
+    local ok_rl, retry_after = rate_limit.allow(route_config, {
+        consumer = headers["X-Api-Key"] or headers["x-api-key"],
+    })
+    if not ok_rl then
+        metrics.inc("mendr_edge_requests_total", { status = "429", reason = "ratelimit" }, 1)
+        return _M.json_error(429, "RATE_LIMITED",
+            "Rate limit exceeded; retry after " .. tostring(retry_after) .. "s", false)
+    end
+
+    -- AI gateway: TPM/RPM, prompt firewall, semantic cache
+    local ok_ai, ai_extra = ai_gateway.enforce(route_config, ctx)
+    if not ok_ai then
+        metrics.inc("mendr_edge_requests_total", { status = "429", reason = "ai" }, 1)
+        local code = (tostring(ai_extra or ""):find("firewall", 1, true)) and 403 or 429
+        return _M.json_error(code, code == 403 and "AI_FIREWALL" or "AI_RATE_LIMITED",
+            ai_extra or "AI policy denied", false)
+    end
+    if type(ai_extra) == "table" and ai_extra.body then
+        ngx.status = ai_extra.status or 200
+        ngx.header.content_type = ai_extra.content_type or "application/json"
+        ngx.header["X-Mendr-Cache"] = "SEMANTIC-HIT"
+        ngx.say(ai_extra.body)
+        return ngx.exit(ngx.status)
+    end
+    if ngx.ctx.ai_upstream_base then
+        route_config.targetBaseUrl = ngx.ctx.ai_upstream_base
+    end
+
+    -- Response cache hit (capability cache)
+    local cached = response_cache.get(route_config, method)
+    if cached and cached.body then
+        ngx.status = cached.status or 200
+        ngx.header.content_type = cached.content_type or "application/json"
+        ngx.header["X-Mendr-Cache"] = "HIT"
+        ngx.say(cached.body)
+        metrics.inc("mendr_edge_requests_total", { status = "cache_hit" }, 1)
+        return ngx.exit(ngx.status)
+    end
 
     -- Strict undeclared-surface enforcement (observe by default)
     local ok_surface, surface_err = check_strict_surface(route_config, ctx)
@@ -468,8 +568,14 @@ function _M.run(ctx)
         end
     end
 
-    local target_base = config.rewrite_localhost(route_config.targetBaseUrl)
-    if not target_base or target_base == "" then
+    local target_base = peer_resolver.prepare(route_config, {
+        hash_key = headers["X-Correlation-Id"] or headers["x-correlation-id"] or ngx.var.remote_addr,
+    })
+    local use_balancer = ngx.ctx.use_dynamic_balancer == true
+    if not use_balancer then
+        target_base = config.rewrite_localhost(target_base or route_config.targetBaseUrl)
+    end
+    if not use_balancer and (not target_base or target_base == "") then
         if config.java_fallback_enabled() then
             delegate_to_java(ctx, "unresolved target URL")
             return
@@ -478,15 +584,30 @@ function _M.run(ctx)
             "No target URL resolved for service '" .. target_service .. "'", true)
     end
 
-    if target_base:sub(-1) == "/" then
+    if not use_balancer and target_base:sub(-1) == "/" then
         target_base = target_base:sub(1, -2)
     end
 
-    -- Upstream URL: use concrete path for ingress (e.g. /users/42), template for envelope
+    ngx.ctx.trafficPolicy = route_config.trafficPolicy
+    if type(route_config.targetInstances) == "table" then
+        ngx.ctx.balancer_peers = route_config.targetInstances
+    end
+
+    -- Upstream URL: named upstream for multi-instance (enables proxy_next_upstream),
+    -- absolute URL for single-instance back-compat.
     local path_for_upstream = concrete_path
-    local target_url = target_base .. path_for_upstream
-    ngx.var.target_upstream = target_url
-    ngx.ctx.targetServiceUrl = target_url
+    if use_balancer then
+        local path = path_for_upstream
+        if path:sub(1, 1) ~= "/" then path = "/" .. path end
+        ngx.var.target_upstream = "http://mendr_dynamic" .. path
+        ngx.ctx.targetServiceUrl = (ngx.ctx.selected_peer or "mendr_dynamic") .. path
+        ngx.ctx.selected_peer = ngx.ctx.selected_peer
+    else
+        local target_url = target_base .. path_for_upstream
+        ngx.var.target_upstream = target_url
+        ngx.ctx.targetServiceUrl = target_url
+        ngx.ctx.selected_peer = target_base
+    end
 
     ngx.req.set_method(ngx["HTTP_" .. method:upper()] or ngx.HTTP_GET)
 
@@ -534,7 +655,11 @@ function _M.run(ctx)
     ngx.req.set_header("X-Mendr-Gateway", "true")
     ngx.req.set_header("X-Mendr-Data-Plane", "lua")
     ngx.req.set_header("X-Source-Service", source_service)
-    ngx.req.set_header("X-Resolved-URL", target_base)
+    if use_balancer then
+        ngx.req.set_header("X-Resolved-URL", ngx.ctx.selected_peer or "mendr_dynamic")
+    else
+        ngx.req.set_header("X-Resolved-URL", target_base)
+    end
     -- Path A1: opportunistically request RFC 9457 when client did not set Accept.
     local existing_accept = headers and (headers["Accept"] or headers["accept"])
     if not existing_accept or existing_accept == "" then
@@ -549,6 +674,7 @@ function _M.run(ctx)
 
     if route_config.responseProgram and not route_config.responseProgram.empty then
         ngx.ctx.responseProgram = route_config.responseProgram
+        ngx.ctx.programHash = route_config.programHash
     end
 end
 

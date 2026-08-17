@@ -208,6 +208,106 @@ do
     check("missing op fails closed", out.obj_id.item_id.transmission_id == "TXN-123")
 end
 
+-- 18) undo log: fail-closed after a successful prior op does not leak the first write
+do
+    local src = { amount = 50, name = "x" }
+    local out = T.apply_program(src, prog({
+        { op = "rename", from = "/name", to = "/user_name" },
+        { op = "scale", path = "/amount", numerator = 1000, denominator = 1,
+          expectedMin = 0, expectedMax = 100 },
+    }))
+    check("undo restores prior rename on later fault", out.name == "x" and out.user_name == nil)
+    check("undo restores scale source", out.amount == 50)
+end
+
+-- 19) wrap root-swap fail-closed
+do
+    local src = { n = 10 }
+    local out = T.apply_program(src, prog({
+        { op = "wrap", key = "data" },
+        { op = "scale", path = "/data/n", numerator = 1000, denominator = 1,
+          expectedMin = 0, expectedMax = 1 },
+    }))
+    check("wrap+fault returns original root", out.n == 10 and out.data == nil)
+end
+
+-- 20) strip_unknown spill: mutations are not applied unless undo was recorded
+do
+    local src = { keep = true }
+    for i = 1, 70 do src["k" .. i] = i end
+    local out = T.apply_ops(src, {
+        { op = "strip_unknown", path = "/", allowed = { "keep" } },
+    })
+    check("strip spill still keeps allow-list", out.keep == true)
+    check("strip spill still drops extras", out.k1 == nil and out.k70 == nil)
+end
+
+-- 21) wrap after a full undo log is not double-wrapped on spill retry
+do
+    local ops = {}
+    for i = 1, 64 do
+        ops[i] = { op = "default", path = "/d" .. i, value = 1, on = "ABSENT" }
+    end
+    ops[65] = { op = "wrap", key = "data" }
+    local out = T.apply_ops({}, ops)
+    check("wrap after cap is single wrap", type(out.data) == "table" and out.data.d1 == 1)
+    check("wrap after cap is not nested", out.data.data == nil and out.d1 == nil)
+end
+
+-- P5: splice semantic oracle against the shared corpus.json when cjson is available.
+do
+    local ok_c, cjson = pcall(require, "cjson.safe")
+    local ok_s, splice = pcall(require, "splice")
+    if not (ok_c and ok_s and cjson and splice) then
+        print("SKIP splice corpus — cjson.safe not available")
+    else
+        local function deep_eq(a, b)
+            if a == b then return true end
+            if type(a) ~= type(b) then return false end
+            if type(a) ~= "table" then return false end
+            for k, v in pairs(a) do
+                if not deep_eq(v, b[k]) then return false end
+            end
+            for k in pairs(b) do
+                if a[k] == nil then return false end
+            end
+            return true
+        end
+        local function load_corpus()
+            for _, p in ipairs({ "spec/corpus.json", "./spec/corpus.json" }) do
+                local f = io.open(p, "r")
+                if f then
+                    local raw = f:read("*a")
+                    f:close()
+                    return cjson.decode(raw)
+                end
+            end
+        end
+        local corpus = load_corpus()
+        if not corpus then
+            print("SKIP splice corpus — spec/corpus.json not found")
+        else
+            for _, c in ipairs(corpus) do
+                local streamed = splice.apply(c.body, prog(c.ops))
+                local decoded = cjson.decode(c.body)
+                local orig = T.deep_copy(decoded)
+                local dom = T.apply_program(T.deep_copy(decoded), prog(c.ops))
+                if c.failClosed then
+                    check("transform_ops corpus " .. c.name,
+                        streamed ~= nil and deep_eq(cjson.decode(streamed), orig)
+                        and deep_eq(dom, orig))
+                else
+                    local got = streamed and cjson.decode(streamed)
+                    check("transform_ops corpus " .. c.name, got ~= nil and deep_eq(got, dom))
+                    if c.expected then
+                        check("transform_ops expected " .. c.name, deep_eq(dom, c.expected))
+                    end
+                end
+            end
+        end
+    end
+end
+
 print(string.rep("-", 40))
 if failures == 0 then
     print("ALL PASSED")
