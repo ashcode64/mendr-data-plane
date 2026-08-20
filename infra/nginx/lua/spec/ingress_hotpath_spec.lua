@@ -87,11 +87,47 @@ package.preload["config"] = function()
     }
 end
 
+-- Minimal shared-dict stub. proxy_core pulls peer_resolver → circuit_breaker
+-- (and rate_limit / metrics / response_cache / ai_gateway / auth_jwt), all of
+-- which index ngx.shared.* at module load time.
+local function new_dict()
+    local data = {}
+    return {
+        get = function(_, k) return data[k] end,
+        set = function(_, k, v) data[k] = v; return true end,
+        add = function(_, k, v)
+            if data[k] ~= nil then return nil, "exists" end
+            data[k] = v
+            return true
+        end,
+        incr = function(_, k, n, init)
+            local cur = tonumber(data[k]) or tonumber(init) or 0
+            cur = cur + (tonumber(n) or 1)
+            data[k] = cur
+            return cur
+        end,
+        delete = function(_, k) data[k] = nil end,
+        ttl = function() return 0 end,
+        expire = function() return true end,
+    }
+end
+
 ngx = {
     null = {},
+    shared = {
+        mendr_circuit_breaker = new_dict(),
+        mendr_lb_rr = new_dict(),
+        mendr_rate_limit = new_dict(),
+        mendr_metrics = new_dict(),
+        mendr_response_cache = new_dict(),
+        mendr_jwks = new_dict(),
+        mendr_sync_state = new_dict(),
+        dedup_cache = new_dict(),
+    },
     log = function() end,
     INFO = 6, WARN = 4, ERR = 3, DEBUG = 7, CRIT = 2,
     time = function() return 0 end,
+    now = function() return 0 end,
     req = {},
     ctx = {},
     header = {},

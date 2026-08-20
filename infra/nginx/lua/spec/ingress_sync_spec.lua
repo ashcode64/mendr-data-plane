@@ -1,4 +1,4 @@
--- ingress_sync_spec.lua ù worker version catch-up / NO_TREE retry helpers
+-- ingress_sync_spec.lua ? worker version catch-up / NO_TREE retry helpers
 --   cd infra/nginx/lua && lua spec/ingress_sync_spec.lua
 
 package.path = package.path .. ';../?.lua;./?.lua'
@@ -21,11 +21,17 @@ if not ok_cjson then
 end
 
 local function reset_modules()
-    package.loaded['ingress_routing'] = nil
-    package.loaded['proxy_core'] = nil
-    package.loaded['resty.redis'] = nil
-    package.loaded['resty.radixtree'] = nil
-    package.loaded['config'] = nil
+    -- Clear both loaded caches and preloads. The NO_TREE block installs a stub
+    -- via package.preload['ingress_routing']; leaving that in place makes later
+    -- requires return the stub (no match_pair / no real reload_from_redis).
+    local names = {
+        'ingress_routing', 'ingress', 'proxy_core', 'identity_resolver',
+        'resty.redis', 'resty.radixtree', 'config', 'cjson.safe',
+    }
+    for _, name in ipairs(names) do
+        package.loaded[name] = nil
+        package.preload[name] = nil
+    end
 end
 
 local function new_shared(init)
@@ -185,6 +191,9 @@ do
     require('ingress')
     check('ingress NO_TREE retry explicitly calls ensure_fresh', calls.ensure == 1)
     check('ingress NO_TREE retry performs second match', calls.match == 2 and ngx.ctx._ran == true)
+
+    -- Drop stub preloads so later blocks load the real ingress_routing module.
+    reset_modules()
 end
 
 do
