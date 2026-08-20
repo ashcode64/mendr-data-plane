@@ -141,8 +141,86 @@ local function match_radix(table_obj, method, uri)
     return meta.target, meta.endpoint_template, meta.enforce
 end
 
+function _M.get_last_sync_version()
+    return last_sync_version
+end
+
+--- Explicitly set (or clear) the worker-local sync version. Used by sync_client
+--- to roll back after a pair-rebuild failure so worker 0 keeps retrying pairs
+--- even though shared last_version was bumped for other workers.
+function _M.set_last_sync_version(version)
+    last_sync_version = version
+end
+
+--- Lazy catch-up: compare shared last_version to this worker's trees; reload from Redis on mismatch.
+--- Uses an atomic shared-dict lock so N workers do not rebuild the same payload concurrently.
+function _M.ensure_fresh()
+    local sync_dict = ngx.shared.mendr_sync_state
+    if not sync_dict then
+        return true
+    end
+    local shared = tostring(sync_dict:get("last_version") or "0")
+    local local_v = tostring(last_sync_version or "")
+    if shared == local_v then
+        return true
+    end
+    -- Version "0" with empty local is cold-start before first sync — nothing to load yet.
+    if shared == "0" and (last_sync_version == nil or last_sync_version == "") then
+        return true
+    end
+
+    local function try_reload_under_lock()
+        local ok_lock, err_lock = sync_dict:add("ingress:rebuild_lock", 1, 5)
+        if not ok_lock then
+            return false, err_lock
+        end
+        -- Re-check under lock (another worker may have finished).
+        local shared_now = tostring(sync_dict:get("last_version") or "0")
+        if shared_now ~= tostring(last_sync_version or "") then
+            local ok_reload, reload_err = _M.reload_from_redis(shared_now)
+            if not ok_reload then
+                ngx.log(ngx.WARN, "ingress_routing: ensure_fresh reload failed (keeping LKG): ",
+                    tostring(reload_err))
+                -- Do not advance last_sync_version — retry next request.
+            end
+        end
+        sync_dict:delete("ingress:rebuild_lock")
+        return true, nil
+    end
+
+    local ok_lock, err_lock = try_reload_under_lock()
+    if ok_lock then
+        return true
+    end
+
+    -- Loser: brief wait for winner, then one immediate reload attempt once the
+    -- lock clears (reduces cold-worker NO_TREE on the same request).
+    for _ = 1, 5 do
+        ngx.sleep(0.01)
+        if tostring(last_sync_version or "") == tostring(sync_dict:get("last_version") or "0") then
+            return true
+        end
+        if not sync_dict:get("ingress:rebuild_lock") then
+            break
+        end
+    end
+    if tostring(last_sync_version or "") ~= tostring(sync_dict:get("last_version") or "0") then
+        local ok_retry = try_reload_under_lock()
+        if ok_retry then
+            return true
+        end
+    end
+    if err_lock and err_lock ~= "exists" then
+        ngx.log(ngx.WARN, "ingress_routing: ensure_fresh lock: ", tostring(err_lock))
+    end
+    -- Still stale: serve LKG for this request (do not block indefinitely).
+    return true
+end
+
 --- Match host + method + concrete path → targetService, endpointTemplate, enforce, err
 function _M.match(host, method, uri)
+    _M.ensure_fresh()
+
     if not host or host == "" then
         return nil, nil, nil, "missing host"
     end
@@ -173,6 +251,8 @@ end
 --- Envelope-path template resolution: match concrete endpoint against templates
 --- for a (source, target) pair. Returns the canonical endpoint template or nil.
 function _M.match_pair(source_service, target_service, concrete_endpoint)
+    _M.ensure_fresh()
+
     if not source_service or not target_service or not concrete_endpoint then
         return nil
     end
@@ -337,48 +417,123 @@ function _M.rebuild(routes_by_host, sync_version)
     return true
 end
 
+local function load_pair_keys_map(red)
+    local raw = red:get("mendr:ingress:pair_keys")
+    if not raw or raw == ngx.null then
+        return nil
+    end
+    local keys, derr = cjson.decode(raw)
+    if type(keys) ~= "table" then
+        ngx.log(ngx.WARN, "ingress_routing: bad mendr:ingress:pair_keys: ", tostring(derr))
+        return nil
+    end
+    local routes_map = {}
+    for _, k in ipairs(keys) do
+        if type(k) == "string" then
+            routes_map[k] = true
+        end
+    end
+    return routes_map
+end
+
+--- Fallback when mendr:ingress:pair_keys is absent (e.g. an edge upgraded before
+--- the first post-upgrade sync wrote the index). Scans routeconfig keys directly
+--- so envelope pair trees can still be rebuilt. KEYS is O(N) but this path is
+--- rare (only until the next sync writes pair_keys).
+local function scan_routeconfig_pair_keys(red)
+    local keys = red:keys("mendr:routeconfig:*")
+    if not keys or keys == ngx.null then
+        return nil
+    end
+    local routes_map = {}
+    for _, k in ipairs(keys) do
+        if type(k) == "string" and k:find("mendr:routeconfig:", 1, true) then
+            routes_map[k] = true
+        end
+    end
+    if next(routes_map) == nil then
+        return nil
+    end
+    return routes_map
+end
+
 --- Load ingress table(s) from Redis key mendr:ingress:{host} (JSON routes array)
---- or mendr:ingress:tables (JSON map host→routes). Called after sync apply.
+--- or mendr:ingress:tables (JSON map host→routes). Also reloads pair trees from
+--- mendr:ingress:pair_keys (or a routeconfig SCAN fallback when that index is
+--- missing). Called after sync apply and from ensure_fresh.
 function _M.reload_from_redis(sync_version)
     local red, err = redis_connect()
     if not red then
         return false, err
     end
 
-    local raw = red:get("mendr:ingress:tables")
-    if raw and raw ~= ngx.null then
-        local tables, derr = cjson.decode(raw)
-        redis_close(red)
-        if not tables then
-            return false, "decode mendr:ingress:tables failed: " .. tostring(derr)
-        end
-        return _M.rebuild(tables, sync_version)
+    local pair_map = load_pair_keys_map(red)
+    if not pair_map then
+        -- pair_keys index missing (pre-first-sync upgrade): scan routeconfig keys.
+        pair_map = scan_routeconfig_pair_keys(red)
     end
 
-    -- Fallback: scan individual host keys (dev / small deployments)
-    local keys = red:keys("mendr:ingress:*")
-    local tables = {}
-    if keys and keys ~= ngx.null then
-        for _, key in ipairs(keys) do
-            if key ~= "mendr:ingress:tables" then
-                local host = key:sub(#"mendr:ingress:" + 1)
-                local v = red:get(key)
-                if v and v ~= ngx.null then
-                    local routes = cjson.decode(v)
-                    if type(routes) == "table" then
-                        tables[host] = routes
+    -- Capture pre-rebuild version so a later pair failure can roll it back.
+    -- Host trees may still be swapped (newer hosts + LKG pairs is safe); we
+    -- must not advance last_sync_version or envelope catch-up stops forever.
+    local prev_version = last_sync_version
+
+    local raw = red:get("mendr:ingress:tables")
+    local host_ok, host_err
+    if raw and raw ~= ngx.null then
+        local tables, derr = cjson.decode(raw)
+        if not tables then
+            redis_close(red)
+            return false, "decode mendr:ingress:tables failed: " .. tostring(derr)
+        end
+        host_ok, host_err = _M.rebuild(tables, sync_version)
+    else
+        -- Fallback: scan individual host keys (dev / small deployments)
+        local keys = red:keys("mendr:ingress:*")
+        local tables = {}
+        if keys and keys ~= ngx.null then
+            for _, key in ipairs(keys) do
+                if key ~= "mendr:ingress:tables" and key ~= "mendr:ingress:pair_keys"
+                    and type(key) == "string" and key:sub(1, #"mendr:ingress:") == "mendr:ingress:" then
+                    local host = key:sub(#"mendr:ingress:" + 1)
+                    if host ~= "pair_keys" and host ~= "tables" then
+                        local v = red:get(key)
+                        if v and v ~= ngx.null then
+                            local routes = cjson.decode(v)
+                            if type(routes) == "table" then
+                                tables[host] = routes
+                            end
+                        end
                     end
                 end
             end
         end
+        if next(tables) == nil then
+            host_ok, host_err = _M.rebuild({}, sync_version)
+        else
+            host_ok, host_err = _M.rebuild(tables, sync_version)
+        end
     end
-    redis_close(red)
 
-    if next(tables) == nil then
-        -- Empty but successful — install empty map (no routes) rather than leave nil
-        return _M.rebuild({}, sync_version)
+    if not host_ok then
+        redis_close(red)
+        return false, host_err
     end
-    return _M.rebuild(tables, sync_version)
+
+    if pair_map then
+        local ok_pairs, pairs_err = _M.rebuild_pairs_from_route_keys(pair_map, sync_version)
+        if not ok_pairs then
+            -- Roll back version so the next ensure_fresh retries pair rebuild.
+            last_sync_version = prev_version
+            ngx.log(ngx.WARN, "ingress_routing: pair reload failed (keeping LKG pairs; version not advanced): ",
+                tostring(pairs_err))
+            redis_close(red)
+            return false, "pair reload failed: " .. tostring(pairs_err)
+        end
+    end
+
+    redis_close(red)
+    return true
 end
 
 return _M

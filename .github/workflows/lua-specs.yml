@@ -1,0 +1,28 @@
+name: lua-specs
+
+on:
+  push:
+    paths:
+      - 'infra/nginx/lua/**'
+      - '.github/workflows/lua-specs.yml'
+  pull_request:
+    paths:
+      - 'infra/nginx/lua/**'
+      - '.github/workflows/lua-specs.yml'
+
+jobs:
+  lua-specs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.1 + cjson
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 lua-cjson
+
+      - name: Run Lua specs
+        working-directory: infra/nginx/lua
+        env:
+          LUA_BIN: lua5.1
+        run: bash spec/run_all.sh

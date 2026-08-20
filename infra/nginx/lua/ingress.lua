@@ -88,6 +88,15 @@ local uri    = ngx.var.uri
 local target_service, endpoint_template, enforce, merr =
     ingress_rt.match(host, method, uri)
 
+-- Cold worker racing the first rebuild lock: force one more catch-up, then retry.
+if not target_service and merr == "NO_TREE" then
+    if ingress_rt.ensure_fresh then
+        ingress_rt.ensure_fresh()
+    end
+    target_service, endpoint_template, enforce, merr =
+        ingress_rt.match(host, method, uri)
+end
+
 if not target_service then
     local fallthrough = ingress_rt.handle_fallthrough(tenant, source_service, merr, {
         enforce = config.ingress_undeclared_enforce(),

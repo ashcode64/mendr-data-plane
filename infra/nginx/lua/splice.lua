@@ -10,9 +10,11 @@
 -- BOUNDED_WINDOW holds only the active inter-pointer span; overflow spills
 -- to DOM if nothing has been flushed, else the flushed prefix is left alone.
 -- Value-mutating ops stream: a fault re-emits the original matched-value bytes.
--- Structural programs drain completed members (TTFB). After a flush, errors
--- do not emit the original body. The original is state.buf until the first
--- drain (then compact); there is no second raw copy.
+-- Structural programs drain completed members (TTFB). Value-mutating and
+-- BOUNDED_WINDOW programs hold until EOF so fail-closed cannot torn-page.
+-- After a flush, faults abort the incomplete response (body_filter). The
+-- original is state.buf until the first drain (then compact); there is no
+-- second raw copy.
 
 local cjson = require("cjson.safe")
 local transform = require("transform")
@@ -745,10 +747,10 @@ local function compile(program)
         hold_array = hold_array,
         array_ops = array_ops,
         array_span = array_span,
-        -- Unwrap is a deferred-object-frame (extract at EOF). Value ops stream
-        -- with per-value fail-closed. Windows hold only the active inter-pointer
-        -- span (must_hold is dynamic; see window_blocking).
-        hold_output = unwrap_key ~= nil,
+        -- Unwrap is a deferred-object-frame (extract at EOF). Value ops and
+        -- BOUNDED_WINDOW hold until EOF so a fail-closed cannot torn-page after
+        -- flush. Pure structural FORWARD_ONLY (rename/remove/wrap) may drain early.
+        hold_output = unwrap_key ~= nil or has_value or (next(windows) ~= nil),
     }
 end
 
@@ -1079,6 +1081,10 @@ local function window_blocking(state)
 end
 
 local function refresh_hold(state)
+    if state.compiled and state.compiled.hold_output then
+        state.must_hold = true
+        return
+    end
     if state.compiled and state.compiled.unwrap_key then
         state.must_hold = true
         return

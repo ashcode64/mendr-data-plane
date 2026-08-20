@@ -216,6 +216,20 @@ local ep      = envelope.endpoint or ""
 local method  = envelope.method or "GET"
 local status  = ngx.status
 
+-- Envelope-path endpoints may be concrete; canonicalize to the route template
+-- (when the pair tree knows it) so failure dedup + reporting key on the template,
+-- matching the ingress path (which already reports endpoint_template).
+if source ~= "" and target ~= "" and ep ~= "" and ep:find("{", 1, true) == nil then
+    local ok_rt, ingress_rt = pcall(require, "ingress_routing")
+    if ok_rt and ingress_rt and ingress_rt.match_pair then
+        local ok_m, tmpl = pcall(ingress_rt.match_pair, source, target, ep)
+        if ok_m and tmpl and tmpl ~= "" then
+            ep = tmpl
+            ngx.ctx.reportEndpoint = tmpl
+        end
+    end
+end
+
 -- Circuit breaker + Prometheus metrics + OTel export (Phases 1 / 5)
 do
     local ok_m, metrics = pcall(require, "metrics")
@@ -282,58 +296,77 @@ do
     end
 end
 
--- ── 1. Failure reporting (status >= 400 or upstream error) ───────────────────
+-- ── 1. Failure reporting (status >= 400, or splice abort after flush) ────────
 
-if status >= 400 then
-    -- Dedup: first-occurrence MUST escalate, only suppress repeats
-    if dedup.should_process("fail", source, target, ep, 60) then
-        local category = classify_failure(status, envelope)
+local function schedule_failure_report(category, error_code, err_msg, response_payload, status_override)
+    local suppressed
+    local should, supp = dedup.should_process("fail", source, target, ep, 60, category)
+    if not should then
+        return
+    end
+    suppressed = supp or 0
 
-        local cors_blocked_at = ngx.ctx.corsBlockedAt
-        if category == "CORS_UPSTREAM" then
-            cors_blocked_at = "UPSTREAM"
-        elseif category == "CORS" and cors_blocked_at == nil then
-            cors_blocked_at = "EDGE"
-        end
+    local report_status = status_override or status
 
-        local problem_detail, corr, req_id = build_problem_detail(status, envelope, category, source, target, ep)
+    local cors_blocked_at = ngx.ctx.corsBlockedAt
+    if category == "CORS_UPSTREAM" then
+        cors_blocked_at = "UPSTREAM"
+    elseif category == "CORS" and cors_blocked_at == nil then
+        cors_blocked_at = "EDGE"
+    end
 
-        -- Prefer problem detail text when richer than synthetic message
-        local err_msg = extract_error_message(status, envelope)
+    local problem_detail, corr, req_id = build_problem_detail(report_status, envelope, category, source, target, ep)
+    if not err_msg or err_msg == "" then
+        err_msg = extract_error_message(status, envelope)
         if problem_detail.detail and problem_detail.detail ~= "" then
             err_msg = problem_detail.detail
         end
-
-        local failure_data = {
-            sourceService      = source,
-            targetService      = target,
-            endpoint           = ep,
-            httpMethod         = method,
-            errorCode          = status,
-            errorType          = category .. "_FAILURE",
-            failureCategory    = category,
-            errorMessage       = err_msg,
-            requestPayload     = ngx.ctx.requestPayload,
-            attemptedUrl       = ngx.var.target_upstream,
-            targetServiceUrl   = ngx.ctx.targetServiceUrl,
-            registeredBaseUrl  = ngx.ctx.registeredBaseUrl,
-            requestOrigin      = envelope.headers and (envelope.headers.Origin or envelope.headers.origin),
-            upstreamOriginSent = ngx.ctx.outboundOrigin,
-            corsBlockedAt      = cors_blocked_at,
-            responsePayload    = ngx.ctx.upstreamErrorBody,
-            correlationId      = corr,
-            requestId          = req_id,
-            traceparent        = resolve_traceparent(envelope),
-            responseHeaders    = ngx.ctx.upstreamResponseHeaders,
-            problemDetail      = problem_detail,
-        }
-        failure_data = pii.scrub(failure_data)
-
-        local ok, err = ngx.timer.at(0, report_failure, failure_data)
-        if not ok then
-            ngx.log(ngx.ERR, "log.lua: failed to schedule failure report timer: ", err)
-        end
     end
+
+    local failure_data = {
+        sourceService      = source,
+        targetService      = target,
+        endpoint           = ep,
+        httpMethod         = method,
+        errorCode          = error_code or report_status,
+        errorType          = category .. "_FAILURE",
+        failureCategory    = category,
+        errorMessage       = err_msg,
+        requestPayload     = ngx.ctx.requestPayload,
+        attemptedUrl       = ngx.var.target_upstream,
+        targetServiceUrl   = ngx.ctx.targetServiceUrl,
+        registeredBaseUrl  = ngx.ctx.registeredBaseUrl,
+        requestOrigin      = envelope.headers and (envelope.headers.Origin or envelope.headers.origin),
+        upstreamOriginSent = ngx.ctx.outboundOrigin,
+        corsBlockedAt      = cors_blocked_at,
+        responsePayload    = response_payload or ngx.ctx.upstreamErrorBody,
+        correlationId      = corr,
+        requestId          = req_id,
+        traceparent        = resolve_traceparent(envelope),
+        responseHeaders    = ngx.ctx.upstreamResponseHeaders,
+        problemDetail      = problem_detail,
+        suppressedCount    = suppressed > 0 and suppressed or nil,
+    }
+    failure_data = pii.scrub(failure_data)
+
+    local ok, err = ngx.timer.at(0, report_failure, failure_data)
+    if not ok then
+        ngx.log(ngx.ERR, "log.lua: failed to schedule failure report timer: ", err)
+    end
+end
+
+if status >= 400 then
+    schedule_failure_report(classify_failure(status, envelope), status, nil, nil)
+elseif ngx.ctx.splice_abort_after_flush then
+    local reason = ngx.ctx.spliceAbortReason or "after_flush"
+    -- Use 502 for problem-detail + errorCode even when ngx.status is still 200.
+    schedule_failure_report(
+        "SPLICE",
+        502,
+        "Splice fault after flush; connection aborted (incomplete response): " .. tostring(reason),
+        { spliceAbort = true, reason = reason },
+        502
+    )
 end
 
 -- ── 2. Async response contract validation (status < 400, hasResponseContract) ──

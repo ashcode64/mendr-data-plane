@@ -80,6 +80,48 @@ end
 -- programs that hold). Above this we spill to the DOM path (fail-open).
 local PREFLUSH_CAP = 1024 * 1024
 
+--- After headers are sent, a splice fault cannot unsend the flushed prefix.
+--- Signal incompleteness at the transport layer (do not cleanly finish JSON).
+--- HTTP/1.x: return ngx.ERROR (incomplete chunked body). HTTP/2+: raise Lua
+--- error — never return ngx.ERROR under H2 (fake-connection UAF, openresty#2500).
+local function abort_incomplete_response(reason)
+    reason = tostring(reason or "unknown")
+    ngx.log(ngx.ERR, "body_filter: splice fault after flush; aborting incomplete response: ", reason)
+    ngx.ctx.splice_abort_after_flush = true
+    ngx.ctx.failureCategory = "SPLICE"
+    ngx.ctx.spliceAbortReason = reason
+    -- Problem-detail fields now (status 502), so log.lua / ingest see a real
+    -- failure envelope even when ngx.status is still the upstream 200.
+    local ok_pd, pd_mod = pcall(require, "problem_detail")
+    if ok_pd and pd_mod and pd_mod.merge_a3 then
+        local env = ngx.ctx.envelope or {}
+        ngx.ctx.mendrProblemDetail = pd_mod.merge_a3(ngx.ctx.mendrProblemDetail, {
+            category = "SPLICE",
+            status = 502,
+            source = env.sourceService or ngx.ctx.reportSource,
+            target = env.targetService or ngx.ctx.reportTarget,
+            endpoint = env.endpoint or ngx.ctx.reportEndpoint or ngx.var.uri,
+            detail_fallback = "Splice fault after flush; incomplete response: " .. reason,
+            request_uri = ngx.var and ngx.var.request_uri,
+            correlation_id = ngx.ctx.correlationId,
+            request_id = ngx.ctx.requestId,
+        })
+    end
+    local ok_m, metrics = pcall(require, "metrics")
+    if ok_m and metrics and metrics.inc then
+        metrics.inc("mendr_splice_abort_after_flush_total", { reason = reason }, 1)
+    end
+    ngx.arg[1] = nil
+    local ver = 1.1
+    if ngx.req and ngx.req.http_version then
+        ver = tonumber(ngx.req.http_version()) or 1.1
+    end
+    if ver >= 2.0 then
+        error("mendr_splice_abort_after_flush:" .. reason, 0)
+    end
+    return ngx.ERROR
+end
+
 local function run_dom(full_body)
     local function emit_original()
         ngx.arg[1] = full_body
@@ -247,8 +289,7 @@ if will_splice then
 
     if ngx.ctx._splice_spill then
         if st.flushed then
-            ngx.arg[1] = nil
-            return
+            return abort_incomplete_response(tostring(ngx.ctx._splice_spill))
         end
         st.buf = (st.buf or "") .. (chunk or "")
         ngx.arg[1] = nil
@@ -263,9 +304,7 @@ if will_splice then
     local _, err = splice.feed(st, chunk, eof)
     if err == "fail_closed" or st.fail_closed then
         if st.flushed then
-            ngx.log(ngx.WARN, "body_filter: splice fail-closed after flush; leaving prefix")
-            ngx.arg[1] = nil
-            return
+            return abort_incomplete_response("fail_closed")
         end
         ngx.ctx.rawResponseBody = st.buf
         if eof then
@@ -276,10 +315,7 @@ if will_splice then
     end
     if err then
         if st.flushed then
-            ngx.log(ngx.WARN, "body_filter: splice error after flush (", tostring(err),
-                "); not concatenating original")
-            ngx.arg[1] = nil
-            return
+            return abort_incomplete_response(tostring(err))
         end
         ngx.ctx._splice_spill = err
         ngx.log(ngx.WARN, "body_filter: splice failed, spilling to DOM: ", tostring(err))

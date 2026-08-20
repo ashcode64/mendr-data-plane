@@ -55,6 +55,7 @@ local function apply_sync_payload(payload)
 
     local routes = payload.routes
     if type(routes) == "table" then
+        local pair_keys = {}
         for key, value in pairs(routes) do
             if type(key) == "string" and type(value) == "string" then
                 local ok_set, set_err = red:set(key, value)
@@ -62,6 +63,16 @@ local function apply_sync_payload(payload)
                     redis_close(red)
                     return false, "redis SET " .. key .. " failed: " .. (set_err or "unknown")
                 end
+                pair_keys[#pair_keys + 1] = key
+            end
+        end
+        -- Compact key list for lazy worker catch-up (avoid KEYS on every reload).
+        local encoded_keys = cjson.encode(pair_keys)
+        if encoded_keys then
+            local ok_pk, pk_err = red:set("mendr:ingress:pair_keys", encoded_keys)
+            if not ok_pk then
+                redis_close(red)
+                return false, "redis SET mendr:ingress:pair_keys failed: " .. (pk_err or "unknown")
             end
         end
     end
@@ -125,11 +136,19 @@ local function apply_sync_payload(payload)
     -- (last-known-good on failure).
     local ok_req, ingress_rt = pcall(require, "ingress_routing")
     if ok_req and ingress_rt then
+        -- Capture local version before host rebuild so a later pair failure can
+        -- roll it back. Shared last_version is still bumped below so other
+        -- workers catch up hosts; worker 0 then ensure_fresh-retries pairs.
+        local prev_version = ingress_rt.get_last_sync_version and ingress_rt.get_last_sync_version() or nil
+        local host_rebuilt = false
+
         if type(ingress_tables) == "table" then
             local ok_rebuild, rebuild_err = ingress_rt.rebuild(ingress_tables, version)
             if not ok_rebuild then
                 ngx.log(ngx.WARN, "sync_client: ingress radixtree rebuild failed (keeping last-known-good): ",
                     tostring(rebuild_err))
+            else
+                host_rebuilt = true
             end
         end
         -- Pair trees for envelope-path template lookup (retire KEYS scan).
@@ -138,10 +157,20 @@ local function apply_sync_payload(payload)
             if not ok_pairs then
                 ngx.log(ngx.WARN, "sync_client: pair radixtree rebuild failed (keeping last-known-good): ",
                     tostring(pairs_err))
+                -- Host rebuild advanced last_sync_version; roll it back so this
+                -- worker (worker 0) keeps retrying pairs via ensure_fresh.
+                if host_rebuilt and ingress_rt.set_last_sync_version then
+                    ingress_rt.set_last_sync_version(prev_version)
+                    ngx.log(ngx.WARN,
+                        "sync_client: rolled back last_sync_version after pair failure (was ",
+                        tostring(version), ", now ", tostring(prev_version), ")")
+                end
             end
         end
     end
 
+    -- Always publish the new shared version so non-0 workers catch up hosts
+    -- even when this worker's pair rebuild failed (local version rolled back).
     sync_dict:set("last_version", tostring(version))
     -- Invalidate response/semantic cache on route sync so stale HIT bodies cannot linger
     local ok_rc, response_cache = pcall(require, "response_cache")
