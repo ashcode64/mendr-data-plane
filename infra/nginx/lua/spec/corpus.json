@@ -195,7 +195,8 @@
     "body": "{\"items\":[10,20,30]}",
     "ops": [
       {"op": "remove", "path": "/items/0"},
-      {"op": "scale", "path": "/items/0", "numerator": 10, "denominator": 1}
+      {"op": "scale", "path": "/items/0", "numerator": 10, "denominator": 1,
+       "expectedMin": -1e12, "expectedMax": 1e12}
     ],
     "expected": {"items": [200, 30]},
     "perByte": true
@@ -206,5 +207,41 @@
     "ops": [{"op": "copy", "from": "/a/4", "to": "/a/5"}],
     "expected": {"a": [1, 2, 3, 4, 5, 5]},
     "perByte": true
+  },
+  {
+    "name": "reformat-date-epoch-s-to-iso8601",
+    "body": "{\"ts\":1700000000}",
+    "ops": [{"op": "reformat_date", "path": "/ts", "sourceFormat": "epoch_s", "targetFormat": "iso8601"}],
+    "expected": {"ts": "2023-11-14T22:13:20Z"}
+  },
+  {
+    "name": "reformat-date-iso8601-to-epoch-s",
+    "body": "{\"ts\":\"2023-11-14T22:13:20Z\"}",
+    "ops": [{"op": "reformat_date", "path": "/ts", "sourceFormat": "iso8601", "targetFormat": "epoch_s"}],
+    "expected": {"ts": 1700000000}
+  },
+  {
+    "name": "reformat-date-iso8601-to-epoch-ms",
+    "body": "{\"ts\":\"2020-01-01T00:00:00Z\"}",
+    "ops": [{"op": "reformat_date", "path": "/ts", "sourceFormat": "iso8601", "targetFormat": "epoch_ms"}],
+    "expected": {"ts": 1577836800000}
+  },
+  {
+    "name": "scale-kmh-factor",
+    "body": "{\"speed\":100}",
+    "ops": [{
+      "op": "scale", "path": "/speed", "numerator": 0.621371, "denominator": 1,
+      "expectedMin": 0, "expectedMax": 1000000
+    }],
+    "expected": {"speed": 62.1371}
+  },
+  {
+    "name": "scale-celsius-factor-then-offset",
+    "body": "{\"temp\":0}",
+    "ops": [
+      {"op": "scale", "path": "/temp", "numerator": 9, "denominator": 5, "expectedMin": -1000, "expectedMax": 10000},
+      {"op": "arith", "path": "/temp", "operator": "+", "operand": 32, "expectedMin": -1000, "expectedMax": 10000}
+    ],
+    "expected": {"temp": 32}
   }
 ]

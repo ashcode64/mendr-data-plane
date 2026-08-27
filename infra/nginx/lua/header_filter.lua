@@ -55,6 +55,8 @@ do
 
     if will_transform then
         ngx.header.content_length = nil
+        -- Plan, not outcome: body_filter may still miss/spill/abort after headers flush.
+        ngx.header["X-Mendr-Transform-Planned"] = "true"
     end
 end
 

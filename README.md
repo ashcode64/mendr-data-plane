@@ -189,6 +189,14 @@ Gateway listens on **8080** (proxy), and optionally **80** / **443** for ingress
 - `MENDR_EDGE_OBSERVATION_*` — sampled topology edge reporting (off by default)
 - `MENDR_WAF_CORAZA=true` — Coraza + CRS when installed by the image entrypoint
 
+### Response transparency
+
+When a response transform is **planned** (`will_transform` in `header_filter.lua`),
+the edge sets **`X-Mendr-Transform-Planned: true`**. This is a plan bit (like
+`X-Mendr-Canary`), not a success claim — `body_filter` may still miss, spill to
+DOM, or abort after headers flush. Transform latency stays in async telemetry
+(`log.lua`). `planClass` is not exposed on public response headers.
+
 ---
 
 ## Multi-tenant edge onboarding
