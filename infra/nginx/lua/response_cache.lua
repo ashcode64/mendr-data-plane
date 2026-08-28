@@ -69,6 +69,21 @@ function _M.get(route_config, method)
     return nil
 end
 
+local function redis_put(premature, data)
+    if premature then return end
+
+    local ok, err = pcall(function()
+        local red = redis_connect()
+        if not red then return end
+        red:setex("mendr:" .. data.key, data.ttl, data.entry)
+        red:set_keepalive(10000, 50)
+    end)
+
+    if not ok then
+        ngx.log(ngx.WARN, "response_cache: redis put failed: ", err)
+    end
+end
+
 function _M.put(route_config, method, status, body, content_type)
     if not _M.should_cache(route_config, method) then return end
     if status < 200 or status >= 300 then return end
@@ -92,10 +107,14 @@ function _M.put(route_config, method, status, body, content_type)
     if dict then
         dict:set(key, entry, ttl)
     end
-    local red = redis_connect()
-    if red then
-        red:setex("mendr:" .. key, ttl, entry)
-        red:set_keepalive(10000, 50)
+    -- Redis L2 write deferred out of log phase (cosockets forbidden there)
+    local timer_ok, timer_err = ngx.timer.at(0, redis_put, {
+        key = key,
+        ttl = ttl,
+        entry = entry,
+    })
+    if not timer_ok then
+        ngx.log(ngx.WARN, "response_cache: failed to schedule redis put: ", timer_err)
     end
 end
 

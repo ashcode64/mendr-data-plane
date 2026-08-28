@@ -230,72 +230,6 @@ if source ~= "" and target ~= "" and ep ~= "" and ep:find("{", 1, true) == nil t
     end
 end
 
--- Circuit breaker + Prometheus metrics + OTel export (Phases 1 / 5)
-do
-    local ok_m, metrics = pcall(require, "metrics")
-    if ok_m and metrics then
-        metrics.inc("mendr_edge_requests_total", {
-            status = tostring(status),
-            target = target ~= "" and target or "unknown",
-        }, 1)
-        local start = tonumber(ngx.ctx.request_start_ms)
-        if start then
-            metrics.observe_latency((ngx.now() * 1000) - start, { target = target })
-        end
-    end
-    local peer = ngx.ctx.selected_peer
-    local tp = ngx.ctx.trafficPolicy
-    local cb = tp and tp.circuitBreaker
-    local ok_c, circuit = pcall(require, "circuit_breaker")
-    if ok_c and circuit and peer then
-        if status >= 500 or status == 0 then
-            circuit.record_failure(peer, cb)
-        elseif status < 400 then
-            circuit.record_success(peer, cb)
-        end
-    end
-    -- Usage metering (success + error paths)
-    do
-        local ok_u, usage = pcall(require, "usage_meter")
-        if ok_u and usage then
-            local start = tonumber(ngx.ctx.request_start_ms)
-            local lat = start and ((ngx.now() * 1000) - start) or nil
-            local bytes = tonumber(ngx.var.bytes_sent) or 0
-            local tenant = ngx.ctx.tenant_id or ngx.ctx.tenantId
-                or os.getenv("MENDR_TENANT_ID") or "default"
-            usage.record(tenant, target, ep, status, bytes, lat)
-        end
-    end
-    -- Bot error-burst counter
-    if status >= 400 and status < 500 then
-        local ok_b, bot = pcall(require, "bot_detect")
-        if ok_b and bot and bot.record_error then
-            bot.record_error(status)
-        end
-    end
-    -- Response cache store on success
-    if status >= 200 and status < 300 and ngx.ctx.routeConfig then
-        local ok_rc, response_cache = pcall(require, "response_cache")
-        if ok_rc and response_cache and ngx.ctx.rawResponseBody then
-            local cache_body = ngx.ctx.rawResponseBody
-            if type(ngx.ctx.transformedResponseBody) == "table" then
-                local enc = cjson.encode(ngx.ctx.transformedResponseBody)
-                if enc then cache_body = enc end
-            end
-            response_cache.put(ngx.ctx.routeConfig, method, status,
-                cache_body, ngx.header.content_type)
-        end
-        local ok_ai, ai_gateway = pcall(require, "ai_gateway")
-        if ok_ai and ai_gateway and ngx.ctx.ai_semantic_cache_key and ngx.ctx.rawResponseBody then
-            ai_gateway.store_semantic_cache(ngx.ctx.rawResponseBody, ngx.header.content_type)
-        end
-    end
-    local ok_o, otel = pcall(require, "otel")
-    if ok_o and otel then
-        otel.end_and_export(status)
-    end
-end
-
 -- ── 1. Failure reporting (status >= 400, or splice abort after flush) ────────
 
 local function schedule_failure_report(category, error_code, err_msg, response_payload, status_override)
@@ -471,5 +405,71 @@ if config.edge_observation_enabled() and source ~= "" and target ~= "" then
                 ngx.log(ngx.ERR, "log.lua: failed to schedule edge-observation timer: ", err)
             end
         end
+    end
+end
+
+-- ── 4. Best-effort side effects (must not block observability above) ──────────
+-- Circuit breaker + Prometheus metrics + usage metering + OTel export
+
+do
+    local ok_m, metrics = pcall(require, "metrics")
+    if ok_m and metrics then
+        pcall(metrics.inc, metrics, "mendr_edge_requests_total", {
+            status = tostring(status),
+            target = target ~= "" and target or "unknown",
+        }, 1)
+        local start = tonumber(ngx.ctx.request_start_ms)
+        if start then
+            pcall(metrics.observe_latency, metrics, (ngx.now() * 1000) - start, { target = target })
+        end
+    end
+    local peer = ngx.ctx.selected_peer
+    local tp = ngx.ctx.trafficPolicy
+    local cb = tp and tp.circuitBreaker
+    local ok_c, circuit = pcall(require, "circuit_breaker")
+    if ok_c and circuit and peer then
+        if status >= 500 or status == 0 then
+            pcall(circuit.record_failure, circuit, peer, cb)
+        elseif status < 400 then
+            pcall(circuit.record_success, circuit, peer, cb)
+        end
+    end
+    do
+        local ok_u, usage = pcall(require, "usage_meter")
+        if ok_u and usage then
+            local start = tonumber(ngx.ctx.request_start_ms)
+            local lat = start and ((ngx.now() * 1000) - start) or nil
+            local bytes = tonumber(ngx.var.bytes_sent) or 0
+            local tenant = ngx.ctx.tenant_id or ngx.ctx.tenantId
+                or os.getenv("MENDR_TENANT_ID") or "default"
+            pcall(usage.record, usage, tenant, target, ep, status, bytes, lat)
+        end
+    end
+    if status >= 400 and status < 500 then
+        local ok_b, bot = pcall(require, "bot_detect")
+        if ok_b and bot and bot.record_error then
+            pcall(bot.record_error, bot, status)
+        end
+    end
+    if status >= 200 and status < 300 and ngx.ctx.routeConfig then
+        local ok_rc, response_cache = pcall(require, "response_cache")
+        if ok_rc and response_cache and ngx.ctx.rawResponseBody then
+            local cache_body = ngx.ctx.rawResponseBody
+            if type(ngx.ctx.transformedResponseBody) == "table" then
+                local enc = cjson.encode(ngx.ctx.transformedResponseBody)
+                if enc then cache_body = enc end
+            end
+            pcall(response_cache.put, response_cache, ngx.ctx.routeConfig, method, status,
+                cache_body, ngx.header.content_type)
+        end
+        local ok_ai, ai_gateway = pcall(require, "ai_gateway")
+        if ok_ai and ai_gateway and ngx.ctx.ai_semantic_cache_key and ngx.ctx.rawResponseBody then
+            pcall(ai_gateway.store_semantic_cache, ai_gateway,
+                ngx.ctx.rawResponseBody, ngx.header.content_type)
+        end
+    end
+    local ok_o, otel = pcall(require, "otel")
+    if ok_o and otel then
+        pcall(otel.end_and_export, otel, status)
     end
 end
