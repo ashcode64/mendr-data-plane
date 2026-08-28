@@ -39,7 +39,8 @@ COPY https-acme.conf /etc/nginx/https-acme.conf
 COPY https-mtls.conf /etc/nginx/https-mtls.conf
 COPY https-http3.conf /etc/nginx/https-http3.conf
 COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+# Strip Windows CRLF if present (exec fails on Linux with "no such file or directory").
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 EXPOSE 80 443 8080
 # HTTP/3 QUIC uses UDP/443 when enabled

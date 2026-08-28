@@ -1,0 +1,6 @@
+# Shell entrypoints must stay LF — CRLF breaks Linux exec (#!/bin/sh\r).
+* text=auto
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf
+Dockerfile text eol=lf
+*.conf text eol=lf

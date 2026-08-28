@@ -164,6 +164,18 @@ docker compose up -d --build
 
 Gateway listens on **8080** (proxy), and optionally **80** / **443** for ingress + ACME.
 
+### Troubleshooting: `exec /docker-entrypoint.sh: no such file or directory`
+
+Usually **Windows CRLF** in `infra/nginx/docker-entrypoint.sh` when deploying on Linux.
+The image build strips `\r` automatically; after pulling, rebuild:
+
+```bash
+docker compose build --no-cache mendr-gateway
+docker compose up -d
+```
+
+If the working tree still has CRLF, run `dos2unix infra/nginx/docker-entrypoint.sh` before building.
+
 ### Required environment
 
 | Variable | Purpose |
