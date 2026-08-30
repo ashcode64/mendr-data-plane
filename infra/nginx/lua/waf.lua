@@ -14,6 +14,15 @@ local function mode()
     return "detect"
 end
 
+--- Read a numeric field from wafPolicy. JSON null decodes to cjson.null (userdata),
+--- not a Lua table — never index policy without this guard.
+local function policy_number(policy, field, default)
+    if type(policy) ~= "table" then return default end
+    local v = policy[field]
+    if v == nil then return default end
+    return tonumber(v) or default
+end
+
 local function max_body()
     return tonumber(os.getenv("MENDR_WAF_MAX_BODY_BYTES")) or (1024 * 1024) -- 1 MiB inspect
 end
@@ -218,7 +227,7 @@ function _M.inspect(route_config, ctx)
 
     -- Payload size cap
     local cl = tonumber(ngx.var.content_length) or 0
-    local max_allowed = tonumber(policy and policy.maxBodyBytes) or (10 * 1024 * 1024)
+    local max_allowed = policy_number(policy, "maxBodyBytes", 10 * 1024 * 1024)
     if cl > max_allowed then
         metrics.inc("mendr_waf_blocks_total", { reason = "body_size" }, 1)
         if waf_mode == "block" then

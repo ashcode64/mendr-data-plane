@@ -22,6 +22,7 @@ specs=(
     spec/ingress_hotpath_spec.lua
     spec/ingress_sync_spec.lua
     spec/body_filter_abort_spec.lua
+    spec/waf_null_policy_spec.lua
 )
 
 fail=0

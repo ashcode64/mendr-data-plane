@@ -26,10 +26,17 @@ function _M.inspect(route_config)
     end
 
     local ip = ngx.var.remote_addr or "unknown"
-    local rps_threshold = tonumber(policy and policy.botRpsThreshold)
-        or tonumber(os.getenv("MENDR_BOT_RPS")) or 80
-    local err_burst = tonumber(policy and policy.botErrorBurst)
-        or tonumber(os.getenv("MENDR_BOT_ERROR_BURST")) or 40
+    -- wafPolicy may be cjson.null (userdata) when absent in the route snapshot
+    local rps_threshold = tonumber(os.getenv("MENDR_BOT_RPS")) or 80
+    local err_burst = tonumber(os.getenv("MENDR_BOT_ERROR_BURST")) or 40
+    if type(policy) == "table" then
+        if policy.botRpsThreshold ~= nil then
+            rps_threshold = tonumber(policy.botRpsThreshold) or rps_threshold
+        end
+        if policy.botErrorBurst ~= nil then
+            err_burst = tonumber(policy.botErrorBurst) or err_burst
+        end
+    end
 
     if not dict then return true end
 
